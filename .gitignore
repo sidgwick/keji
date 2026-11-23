@@ -1,0 +1,9 @@
+.qoder/
+.taste-skill/
+
+.output/
+.wxt/
+
+dist/
+node_modules/
+__pycache__/
