@@ -368,7 +368,11 @@ async function inspectBilibiliPage<T = Record<string, any>>(tabId: number, optio
             width: Number(track.width) || 0,
             height: Number(track.height) || 0,
             bandwidth: Number(track.bandwidth) || 0,
-            duration
+            duration,
+            bvid,
+            page: pageNo,
+            expectedCid,
+            streamCid: verifiedCid || expectedCid
           };
         }
         const backupUrls = track.backupUrl || track.backup_url || [];

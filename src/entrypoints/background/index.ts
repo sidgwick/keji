@@ -105,6 +105,8 @@ export default defineBackground(() => {
         return { ok: true, source: await readCurrentDashSource(message.tabId, "video", Number(message.maxTargetBytes) || 0, message.lesson || null) };
       case "PREPARE_LESSON_AUDIO":
         return { ok: true, ...await prepareLessonAudioForNote(message.tabId, message.lesson) };
+      case "CACHE_LESSON_AUDIO":
+        return { ok: true, ...await cacheLessonAudio(message.tabId, message.lesson) };
       case "RELEASE_LESSON_AUDIO":
         await releaseLessonAudio();
         return { ok: true };
@@ -311,6 +313,25 @@ export default defineBackground(() => {
     return { duration: Number(response.duration) || Number(videoPayload.duration) || 0, fromCache: Boolean(response.fromCache) };
   }
 
+  async function cacheLessonAudio(tabId?: number, lessonHint: VideoTarget | null = null) {
+    if (!await chrome.permissions.contains({ permissions: ['offscreen'] })) {
+      throw new Error('请先允许课记使用音频处理权限。');
+    }
+    const { videoPayload, audioSource } = await resolveValidatedAudioTrack(tabId, lessonHint);
+    if (lessonHint && (videoPayload.bvid !== lessonHint.bvid || Number(videoPayload.page) !== Number(lessonHint.page)
+      || (lessonHint.cid && Number(videoPayload.cid) !== Number(lessonHint.cid)))) {
+      throw new Error('B 站播放页与当前分 P 不一致，请重新载入本节后再准备媒体文件。');
+    }
+    await ensureOffscreenDocument();
+    const response = await chrome.runtime.sendMessage({
+      target: 'offscreen', type: 'CACHE_LESSON_AUDIO', audioSource, video: videoPayload,
+      videoUrl: videoPayload.url || '', bvid: videoPayload.bvid,
+      page: videoPayload.page, cid: videoPayload.cid || 0
+    });
+    if (!response?.ok) throw new Error(response?.error || '缓存课程音轨失败。');
+    return { size: Number(response.size) || 0, fromCache: Boolean(response.fromCache) };
+  }
+
   async function releaseLessonAudio(): Promise<void> {
     if (!await hasOffscreenDocument()) return;
     await chrome.runtime.sendMessage({ target: "offscreen", type: "RELEASE_LESSON_AUDIO" }).catch(() => {});
@@ -499,6 +520,8 @@ export default defineBackground(() => {
       audioBytes: 0,
       hasVideo: false,
       videoBytes: 0,
+      hasMuxedVideo: false,
+      muxedVideoBytes: 0,
       hasTranscript: false,
       transcriptBytes: 0,
       metaBytes: 0,
@@ -531,9 +554,10 @@ export default defineBackground(() => {
     return {
       audioBytes: opfs.audioBytes,
       videoBytes: opfs.videoBytes,
+      muxedVideoBytes: opfs.muxedVideoBytes,
       transcriptBytes,
       noteIntermediateBytes: noteIntermediate,
-      totalBytes: opfs.audioBytes + opfs.videoBytes + transcriptBytes,
+      totalBytes: opfs.audioBytes + opfs.videoBytes + opfs.muxedVideoBytes + transcriptBytes,
       lessonCount: lessonSet.size
     };
   }

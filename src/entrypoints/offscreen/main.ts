@@ -160,6 +160,26 @@ chrome.runtime.onMessage.addListener((message: any, _sender, sendResponse) => {
       .catch((error: Error) => sendResponse({ ok: false, error: error.message || "准备音轨失败。" }));
     return true;
   }
+  if (message.type === "CACHE_LESSON_AUDIO") {
+    (async () => {
+      assertIdle('转写正在运行，请等待完成后再准备媒体文件。');
+      const bvid = String(message.bvid || '').toUpperCase();
+      const page = Math.max(1, Number(message.page) || 1);
+      const expectedCid = Number(message.cid) || 0;
+      const target: VideoTarget = { bvid, page, url: String(message.videoUrl || '') };
+      const cached = await getCachedAudio(target, { expectedCid });
+      if (cached) return { ok: true, size: cached.size, fromCache: true };
+      const blob = await downloadAudio(message.audioSource, target.url, { controller: new AbortController(), cancelled: false }, false);
+      await putCachedAudio(target, blob, {
+        cid: expectedCid, title: message.video?.title || '', part: message.video?.part || '',
+        duration: Number(message.audioSource?.duration || message.video?.duration) || 0
+      });
+      const saved = await getCachedAudio(target, { expectedCid });
+      if (!saved) throw new Error('音轨下载完成，但无法写入浏览器缓存。');
+      return { ok: true, size: saved.size, fromCache: false };
+    })().then(sendResponse).catch((error: Error) => sendResponse({ ok: false, error: error.message || '缓存音轨失败。' }));
+    return true;
+  }
   if (message.type === "ENCODE_AUDIO_WAV_CHUNK") {
     getOrDecodeLessonAudio(message)
       .then(async (decoded) => {

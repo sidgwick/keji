@@ -10,6 +10,7 @@
   import DiscussionPanel from './DiscussionPanel.svelte';
   import FlashcardPanel from './FlashcardPanel.svelte';
   import MarkdownEditor from './MarkdownEditor.svelte';
+  import MediaFilesPanel from './MediaFilesPanel.svelte';
   import NoteLibrary from './NoteLibrary.svelte';
   import QuizPanel from './QuizPanel.svelte';
   import TranscriptPanel from './TranscriptPanel.svelte';
@@ -190,6 +191,7 @@
 
         <div class="create-primary-column" class:hidden={!workspace.currentVideo}>
           <TranscriptPanel />
+          <MediaFilesPanel />
 
           <section class="work-panel note-panel">
             <header class="panel-heading">
@@ -262,6 +264,7 @@
             <button class="secondary-button" id="export-note-bundle" type="button" onclick={() => ctrl.exportCurrentNoteBundle()}>导出资源包</button>
           </div>
         </header>
+        <details class="result-media-details"><summary>本节媒体文件 · 下载音轨与视频</summary><MediaFilesPanel /></details>
 
         <aside class="note-generation-status" class:hidden={!workspace.generating && !workspace.canResumeGeneration && !workspace.generationError} data-kind={workspace.generationError ? 'error' : workspace.generating ? 'info' : 'warning'} aria-live="polite" aria-atomic="true">
           <div class="note-generation-status-copy">

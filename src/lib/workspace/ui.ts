@@ -31,7 +31,7 @@ export function downloadBlob(filename: string, blob: Blob): void {
   anchor.href = url;
   anchor.download = filename;
   anchor.click();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 
 export function downloadText(filename: string, text: string, type: string): void {

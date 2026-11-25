@@ -346,10 +346,11 @@
             <div class="settings-info-cards">
               <article class="settings-info-card">
                 <h3>过程文件缓存</h3>
-                <p>每节课生成过程中获取的音轨、音轨转文本结果与原视频流会缓存在当前浏览器的 Origin Private File System 中，方便后续重新生成、补充画面分析、片段重识别或与大模型深入讨论。清理过程缓存会释放这些临时媒体与转写过程数据，<strong>已生成的笔记正文、内嵌截图与讨论记录会完整保留</strong>。</p>
+                <p>每节课获取的音轨、无声视频、带声音的合成视频和转写结果会缓存在当前浏览器的 Origin Private File System 中，方便后续下载和复用。清理过程缓存会删除这些媒体与转写过程数据，<strong>已生成的笔记正文、内嵌截图与讨论记录会完整保留</strong>。</p>
                 <div class="cache-breakdown">
                   <span class="cache-stat-pill">总计 <strong>{workspace.totalCacheLabel || '0 B'}</strong></span>
                   <span class="cache-stat-pill">原视频 {formatBytes(workspace.cacheOverview.videoBytes)}</span>
+                  <span class="cache-stat-pill">音画合成 {formatBytes(workspace.cacheOverview.muxedVideoBytes)}</span>
                   <span class="cache-stat-pill">音轨 {formatBytes(workspace.cacheOverview.audioBytes)}</span>
                   <span class="cache-stat-pill">转写缓存 {formatBytes(workspace.cacheOverview.transcriptBytes)}</span>
                   <span class="cache-stat-pill">涉及 {workspace.cacheOverview.lessonCount || 0} 节</span>

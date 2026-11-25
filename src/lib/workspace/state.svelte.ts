@@ -114,6 +114,11 @@ interface WorkspaceState {
   generationError: string;
   generationProgress: GenerationProgress;
   currentLessonHasCachedAudio: boolean;
+  currentLessonHasCachedVideo: boolean;
+  currentLessonHasCachedMuxedVideo: boolean;
+  currentLessonMediaStatus: string;
+  currentLessonMediaBusy: boolean;
+  currentLessonMediaSizes: { audio: number; video: number; audiovisual: number };
   currentLessonCacheBytes: number;
   currentLessonCacheLabel: string;
   totalCacheBytes: number;
@@ -197,6 +202,11 @@ export const workspace = $state<WorkspaceState>({
   generationError: '',
   generationProgress: { completedChunks: 0, totalChunks: 0 },
   currentLessonHasCachedAudio: false,
+  currentLessonHasCachedVideo: false,
+  currentLessonHasCachedMuxedVideo: false,
+  currentLessonMediaStatus: '',
+  currentLessonMediaBusy: false,
+  currentLessonMediaSizes: { audio: 0, video: 0, audiovisual: 0 },
   currentLessonCacheBytes: 0,
   currentLessonCacheLabel: '',
   totalCacheBytes: 0,
@@ -204,6 +214,7 @@ export const workspace = $state<WorkspaceState>({
   cacheOverview: {
     audioBytes: 0,
     videoBytes: 0,
+    muxedVideoBytes: 0,
     transcriptBytes: 0,
     noteIntermediateBytes: 0,
     totalBytes: 0,

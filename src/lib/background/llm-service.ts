@@ -6,7 +6,7 @@ import {
   type KeyFrameItem,
   type VideoTarget,
 } from "../keji.ts";
-import { downloadAndCacheVideo, getCachedVideo, isBilibiliCdnUrl } from "../lesson-cache.ts";
+import { downloadAndCacheVideo, getCachedMuxedVideo, getCachedVideo, isBilibiliCdnUrl } from "../lesson-cache.ts";
 import { resolveNoteStructurePrompt } from "../note-structures.ts";
 import { parseQuizQuestions } from "../quiz.ts";
 import { configureBilibiliCdnRequestHeaders } from "./bilibili.ts";
@@ -581,7 +581,11 @@ async function enrichNoteWithVideoTask(payload: any, taskId: string): Promise<st
       duration: Number(payload.duration) || 0
     };
     const videoUrl = String(payload.videoUrl || "");
-    const cached = await getCachedVideo(lessonTarget, { expectedCid: lessonTarget.cid });
+    const cachedCombined = settings.apiProtocol === 'mimo' && settings.modelCapability === 'video_audio'
+      ? await getCachedMuxedVideo(lessonTarget, { expectedCid: lessonTarget.cid }) : null;
+    const cached = cachedCombined && cachedCombined.size <= MAX_INLINE_VIDEO_BYTES
+      ? cachedCombined : await getCachedVideo(lessonTarget, { expectedCid: lessonTarget.cid });
+    const videoHasAudio = Boolean(cachedCombined && cached === cachedCombined);
     const providerLabel = settings.apiProtocol === "mimo" ? "小米 MiMo" : "OpenAI 兼容接口";
     let videoBlob: Blob;
     let totalBytes = 0;
@@ -645,7 +649,9 @@ async function enrichNoteWithVideoTask(payload: any, taskId: string): Promise<st
           {
             role: "system",
             content: [
-              "你是严谨的音视频课程笔记编辑。你会结合课程讲解内容与当前分 P 的视频画面修订笔记（注意：视频流不含伴随音轨，口述内容来自已有讲解/初稿）。",
+              videoHasAudio
+                ? "你是严谨的音视频课程笔记编辑。当前视频包含画面与伴随音轨，请结合两者修订笔记。"
+                : "你是严谨的音视频课程笔记编辑。你会结合课程讲解内容与当前分 P 的视频画面修订笔记（视频流不含伴随音轨，口述内容来自已有讲解/初稿）。",
               "结合视频中的幻灯片、板书、终端输出、图表、操作步骤和时间变化修订笔记。补充视觉信息时只写画面中清楚可辨的内容；不要臆测。",
               "保留已有知识点、例子、步骤、数据和章节结构；修正被视频证据推翻的描述。",
               "从整段视频中选出 1 到 5 个最值得回看或截图的时刻，在对应章节后输出标记 [[KEYFRAME: HH:MM:SS | 画面与讲解的重点]]；时间戳必须与课程时间线一致，不要按固定间隔取样。",

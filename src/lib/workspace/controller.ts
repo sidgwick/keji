@@ -11,7 +11,7 @@ import {
   type VideoPart,
   type VideoTarget,
 } from '../keji.ts';
-import { BILIBILI_CDN_ORIGINS, formatBytes, getCachedTranscription, getCachedVideo } from '../lesson-cache.ts';
+import { BILIBILI_CDN_ORIGINS, downloadAndCacheVideo, formatBytes, getCachedAudio, getCachedMuxedVideo, getCachedTranscription, getCachedVideo, putCachedMuxedVideo } from '../lesson-cache.ts';
 import {
   formatNoteMarkdown,
   mergeMarkdownSections,
@@ -401,6 +401,11 @@ function renderVideo(info: any, forceTranscript = false): void {
     || Number(previousVideo.page) !== Number(currentVideo!.page)
     || (previousVideo.cid && currentVideo!.cid && Number(previousVideo.cid) !== Number(currentVideo!.cid));
   if (changedVideo) {
+    workspace.currentLessonHasCachedAudio = false;
+    workspace.currentLessonHasCachedVideo = false;
+    workspace.currentLessonHasCachedMuxedVideo = false;
+    workspace.currentLessonMediaSizes = { audio: 0, video: 0, audiovisual: 0 };
+    workspace.currentLessonMediaStatus = '';
     resetActiveNoteFields(currentVideo);
     tx.resetTranscriptionForNewVideo(true);
   }
@@ -1725,6 +1730,9 @@ async function refreshCurrentLessonCacheStatus(target: VideoTarget | null = late
   const lessonKey = target ? Keji.lessonKey(target) : '';
   if (!lessonKey && !noteId) {
     workspace.currentLessonHasCachedAudio = false;
+    workspace.currentLessonHasCachedVideo = false;
+    workspace.currentLessonHasCachedMuxedVideo = false;
+    workspace.currentLessonMediaSizes = { audio: 0, video: 0, audiovisual: 0 };
     workspace.currentLessonCacheBytes = 0;
     workspace.currentLessonCacheLabel = '';
     return null;
@@ -1734,6 +1742,13 @@ async function refreshCurrentLessonCacheStatus(target: VideoTarget | null = late
   const activeKey = Keji.lessonKey(workspace.activeView === 'note' ? (latestVideo || currentVideo) : (currentVideo || latestVideo));
   if (lessonKey && activeKey && lessonKey !== activeKey) return result.status;
   workspace.currentLessonHasCachedAudio = Boolean(result.status.hasAudio);
+  workspace.currentLessonHasCachedVideo = Boolean(result.status.hasVideo);
+  workspace.currentLessonHasCachedMuxedVideo = Boolean(result.status.hasMuxedVideo);
+  workspace.currentLessonMediaSizes = {
+    audio: Number(result.status.audioBytes) || 0,
+    video: Number(result.status.videoBytes) || 0,
+    audiovisual: Number(result.status.muxedVideoBytes) || 0
+  };
   workspace.currentLessonCacheBytes = Number(result.status.totalBytes) || 0;
   workspace.currentLessonCacheLabel = workspace.currentLessonCacheBytes ? formatBytes(workspace.currentLessonCacheBytes) : '';
   return result.status;
@@ -1746,6 +1761,88 @@ export async function refreshCacheOverview() {
   workspace.totalCacheBytes = Number(result.overview.totalBytes) || 0;
   workspace.totalCacheLabel = workspace.totalCacheBytes ? formatBytes(workspace.totalCacheBytes) : '';
   return result.overview;
+}
+
+function activeMediaTarget(): VideoTarget | null {
+  return workspace.activeView === 'note' ? (latestVideo || currentVideo) : (currentVideo || latestVideo);
+}
+
+export async function prepareCurrentLessonMedia(): Promise<void> {
+  if (workspace.currentLessonMediaBusy || workspace.generating) return;
+  const target = activeMediaTarget();
+  if (!target) { showNotice('请先载入一个 B 站视频。', 'error'); return; }
+  workspace.currentLessonMediaBusy = true;
+  try {
+    const cid = Number(target.cid) || 0;
+    const [cachedAudio, cachedVideo, cachedCombined] = await Promise.all([
+      getCachedAudio(target, { expectedCid: cid }),
+      getCachedVideo(target, { expectedCid: cid }),
+      getCachedMuxedVideo(target, { expectedCid: cid })
+    ]);
+    if (!cachedAudio || !cachedVideo) {
+      workspace.currentLessonMediaStatus = '正在请求 B 站媒体访问权限…';
+      const granted = await chrome.permissions.request({ permissions: ['offscreen'], origins: BILIBILI_CDN_ORIGINS });
+      if (!granted) throw new Error('需要音频处理和 B 站 CDN 权限才能缓存媒体文件。');
+    }
+    if (!cachedAudio) {
+      workspace.currentLessonMediaStatus = '正在下载音轨…';
+      const response = await callBackground('CACHE_LESSON_AUDIO', { tabId: currentTabId, lesson: target });
+      if (!response?.ok) throw new Error(response?.error || '下载音轨失败。');
+      await refreshCurrentLessonCacheStatus(target, workspace.activeView === 'note' ? latestNoteId : null);
+    }
+    if (!cachedVideo) {
+      workspace.currentLessonMediaStatus = '正在读取视频轨…';
+      const prepared = await callBackground('PREPARE_VIDEO_CAPTURE');
+      if (!prepared?.ok) throw new Error(prepared?.error || '无法准备视频轨下载。');
+      const response = await callBackground('READ_VIDEO_SOURCE', { tabId: currentTabId, lesson: target });
+      const source = response?.source;
+      if (!response?.ok || !source?.url) throw new Error(response?.error || '无法读取 B 站视频轨。');
+      if (String(source.bvid || '').toUpperCase() !== String(target.bvid || Keji.bvidFromUrl(target.url)).toUpperCase()
+        || Number(source.page) !== Number(target.page)
+        || !source.expectedCid || Number(source.expectedCid) !== Number(source.streamCid)
+        || (cid && cid !== Number(source.expectedCid))) {
+        throw new Error('读取视频轨期间分 P 发生切换，请重新载入课程后重试。');
+      }
+      await downloadAndCacheVideo(target, source.url, {
+        expectedCid: Number(source.expectedCid),
+        meta: { cid: Number(source.expectedCid), title: target.title || '', part: target.part || '', duration: target.duration || 0 },
+        onProgress: (loaded, total) => {
+          workspace.currentLessonMediaStatus = `正在下载纯画面：${formatBytes(loaded)}${total ? ` / ${formatBytes(total)}` : ''}`;
+        }
+      });
+      await refreshCurrentLessonCacheStatus(target, workspace.activeView === 'note' ? latestNoteId : null);
+    }
+    if (!cachedCombined) {
+      workspace.currentLessonMediaStatus = '正在封装带声音的视频…';
+      await putCachedMuxedVideo(target, {
+        expectedCid: cid,
+        onProgress: (fraction) => {
+          workspace.currentLessonMediaStatus = `正在封装带声音的视频：${Math.round(fraction * 100)}%`;
+        }
+      });
+    }
+    await Promise.all([refreshCurrentLessonCacheStatus(target, workspace.activeView === 'note' ? latestNoteId : null), refreshCacheOverview()]);
+    workspace.currentLessonMediaStatus = '三种文件已缓存，可分别下载。';
+    showNotice('三种媒体文件已保存到浏览器本地缓存。', 'success');
+  } catch (error) {
+    workspace.currentLessonMediaStatus = (error as Error).message || '准备媒体文件失败。';
+    showNotice(workspace.currentLessonMediaStatus, 'error');
+  } finally {
+    workspace.currentLessonMediaBusy = false;
+  }
+}
+
+export async function downloadCurrentLessonMedia(kind: 'audio' | 'video' | 'audiovisual'): Promise<void> {
+  const target = activeMediaTarget();
+  if (!target) return;
+  const cid = Number(target.cid) || 0;
+  const cached = kind === 'audio' ? await getCachedAudio(target, { expectedCid: cid })
+    : kind === 'video' ? await getCachedVideo(target, { expectedCid: cid })
+    : await getCachedMuxedVideo(target, { expectedCid: cid });
+  if (!cached) { showNotice('该文件尚未缓存，请先准备媒体文件。', 'error'); return; }
+  const bvid = target.bvid || Keji.bvidFromUrl(target.url);
+  const name = `${bvid}_p${Number(target.page) || 1}.${kind === 'audio' ? 'audio.m4a' : kind === 'video' ? 'video.mp4' : 'audiovisual.mp4'}`;
+  downloadBlob(name, cached.file);
 }
 
 function clearActiveNoteProcessState(clearCurrentAudioFlag = false): void {

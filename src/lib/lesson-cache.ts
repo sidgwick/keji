@@ -1,4 +1,5 @@
 import { Keji, type LessonCacheStatus, type TranscriptSegment, type VideoTarget } from "./keji.ts";
+import { muxDashTracks } from './media-mux.ts';
 
 const CACHE_DIR_NAME = "keji-lesson-cache";
 const MAX_VIDEO_BYTES = 2 * 1024 * 1024 * 1024;
@@ -8,26 +9,28 @@ const ORPHAN_TMP_AGE_MS = 60 * 60 * 1000;
 export const BILIBILI_CDN_SUFFIXES = ["bilivideo.com", "bilivideo.cn", "bilivideo.net", "hdslb.com"];
 export const BILIBILI_CDN_ORIGINS = BILIBILI_CDN_SUFFIXES.map((suffix) => `https://*.${suffix}/*`);
 
-type CacheKind = "audio.bin" | "video.mp4" | "transcript.json" | "meta.json";
+type CacheKind = "audio.bin" | "video.mp4" | "audiovisual.mp4" | "transcript.json" | "meta.json";
 
 interface CacheSizes {
   lessonKey: string;
   audioBytes: number;
   videoBytes: number;
+  muxedVideoBytes: number;
   transcriptBytes: number;
   metaBytes: number;
   opfsBytes: number;
 }
 
-const KIND_TO_FIELD: Record<CacheKind, "audioBytes" | "videoBytes" | "transcriptBytes" | "metaBytes"> = {
+const KIND_TO_FIELD: Record<CacheKind, "audioBytes" | "videoBytes" | "muxedVideoBytes" | "transcriptBytes" | "metaBytes"> = {
   "audio.bin": "audioBytes",
   "video.mp4": "videoBytes",
+  "audiovisual.mp4": "muxedVideoBytes",
   "transcript.json": "transcriptBytes",
   "meta.json": "metaBytes"
 };
 
 function createCacheSizes(lessonKey: string): CacheSizes {
-  return { lessonKey, audioBytes: 0, videoBytes: 0, transcriptBytes: 0, metaBytes: 0, opfsBytes: 0 };
+  return { lessonKey, audioBytes: 0, videoBytes: 0, muxedVideoBytes: 0, transcriptBytes: 0, metaBytes: 0, opfsBytes: 0 };
 }
 
 function addCacheSize(target: CacheSizes, kind: CacheKind, size: number): void {
@@ -97,10 +100,11 @@ export function formatBytes(value: number): string {
   return `${(mb / 1024).toFixed(2)} GB`;
 }
 
-function lessonNames(prefix: string): Record<"audio" | "video" | "transcript" | "meta", string> {
+function lessonNames(prefix: string): Record<"audio" | "video" | "audiovisual" | "transcript" | "meta", string> {
   return {
     audio: `${prefix}.audio.bin`,
     video: `${prefix}.video.mp4`,
+    audiovisual: `${prefix}.audiovisual.mp4`,
     transcript: `${prefix}.transcript.json`,
     meta: `${prefix}.meta.json`
   };
@@ -351,6 +355,38 @@ export async function getCachedVideo(target: string | VideoTarget, { expectedCid
   return { file, size: file.size, mimeType: meta?.videoMime || file.type || "video/mp4", meta };
 }
 
+export async function getCachedMuxedVideo(target: string | VideoTarget, { expectedCid = 0 } = {}) {
+  const prefix = lessonFilePrefix(target);
+  if (!prefix) return null;
+  const dir = await openCacheDir({ create: false });
+  if (!dir) return null;
+  const names = lessonNames(prefix);
+  const [file, meta] = await Promise.all([getFileIfExists(dir, names.audiovisual), readJsonFile(dir, names.meta)]);
+  if (!file || file.size < 1024 || !cidMatches(meta?.cid, expectedCid)) return null;
+  return { file, size: file.size, mimeType: 'video/mp4', meta };
+}
+
+export async function putCachedMuxedVideo(target: string | VideoTarget, options: { expectedCid?: number; onProgress?: (fraction: number) => void } = {}) {
+  const prefix = lessonFilePrefix(target);
+  if (!prefix) throw new Error('无法确定当前分 P。');
+  const existing = await getCachedMuxedVideo(target, options);
+  if (existing) return existing;
+  const dir = await openCacheDir({ create: true });
+  if (!dir) throw new Error('浏览器磁盘缓存不可用，无法保存合成视频。');
+  const [audio, video] = await Promise.all([
+    getCachedAudio(target, { expectedCid: options.expectedCid }),
+    getCachedVideo(target, { expectedCid: options.expectedCid })
+  ]);
+  if (!audio || !video) throw new Error('请先缓存音轨和纯画面，再合成带声音的视频。');
+  const names = lessonNames(prefix);
+  await writeTempAndCommit(dir, names.audiovisual, (writable) =>
+    muxDashTracks(video.file, audio.file, writable, options.onProgress));
+  const file = await getFileIfExists(dir, names.audiovisual);
+  if (!file || file.size < 1024) throw new Error('合成视频没有成功写入缓存。');
+  await updateLessonMeta(target, { cid: Number(options.expectedCid) || Number(video.meta?.cid) || 0, muxedVideoBytes: file.size });
+  return { file, size: file.size, mimeType: 'video/mp4', meta: video.meta };
+}
+
 export async function downloadAndCacheVideo(
   target: string | VideoTarget,
   videoUrl: string,
@@ -499,15 +535,16 @@ export async function getLessonCacheStatus(target: string | VideoTarget): Promis
   const key = normalizeLessonKey(target);
   const prefix = lessonFilePrefix(key);
   const sizes = createCacheSizes(key);
-  const empty: LessonCacheStatus = { ...sizes, hasAudio: false, hasVideo: false, hasTranscript: false, meta: null };
+  const empty: LessonCacheStatus = { ...sizes, hasAudio: false, hasVideo: false, hasMuxedVideo: false, hasTranscript: false, meta: null };
   if (!key || !prefix) return empty;
   const dir = await openCacheDir({ create: false });
   if (!dir) return empty;
 
   const names = lessonNames(prefix);
-  const [audioFile, videoFile, transcriptFile, metaFile] = await Promise.all([
+  const [audioFile, videoFile, muxedFile, transcriptFile, metaFile] = await Promise.all([
     getFileIfExists(dir, names.audio),
     getFileIfExists(dir, names.video),
+    getFileIfExists(dir, names.audiovisual),
     getFileIfExists(dir, names.transcript),
     getFileIfExists(dir, names.meta)
   ]);
@@ -518,12 +555,14 @@ export async function getLessonCacheStatus(target: string | VideoTarget): Promis
   }
   if (audioFile && audioFile.size >= 1024) addCacheSize(sizes, "audio.bin", audioFile.size);
   if (videoFile && videoFile.size >= 1024) addCacheSize(sizes, "video.mp4", videoFile.size);
+  if (muxedFile && muxedFile.size >= 1024) addCacheSize(sizes, "audiovisual.mp4", muxedFile.size);
   if (transcriptFile) addCacheSize(sizes, "transcript.json", transcriptFile.size);
   if (metaFile) addCacheSize(sizes, "meta.json", metaFile.size);
   return {
     ...sizes,
     hasAudio: sizes.audioBytes > 0,
     hasVideo: sizes.videoBytes > 0,
+    hasMuxedVideo: sizes.muxedVideoBytes > 0,
     hasTranscript: sizes.transcriptBytes > 0,
     meta
   };
@@ -546,7 +585,7 @@ export async function listAllLessonOpfsCaches() {
       }
       continue;
     }
-    const match = name.match(/^(BV[0-9A-Za-z]+_p\d+)\.(audio\.bin|video\.mp4|transcript\.json|meta\.json)$/i);
+    const match = name.match(/^(BV[0-9A-Za-z]+_p\d+)\.(audio\.bin|video\.mp4|audiovisual\.mp4|transcript\.json|meta\.json)$/i);
     if (!match) continue;
     const { lessonKey } = keyPartsFromPrefix(match[1]!);
     if (!lessonKey) continue;

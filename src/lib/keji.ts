@@ -127,6 +127,8 @@ export interface LessonCacheStatus {
   audioBytes: number;
   hasVideo: boolean;
   videoBytes: number;
+  hasMuxedVideo: boolean;
+  muxedVideoBytes: number;
   hasTranscript: boolean;
   transcriptBytes: number;
   metaBytes: number;
@@ -139,6 +141,7 @@ export interface LessonCacheStatus {
 export interface CacheOverview {
   audioBytes: number;
   videoBytes: number;
+  muxedVideoBytes: number;
   transcriptBytes: number;
   noteIntermediateBytes: number;
   totalBytes: number;
