@@ -58,12 +58,12 @@
         class="part-search-input"
         type="search"
         bind:value={workspace.partSearch}
-        placeholder="搜索集数或分 P 标题…"
+        placeholder="搜索集数或小节标题…"
       >
     {/if}
   </header>
 
-  <nav id="part-list" class="course-drawer-list" aria-label="课程分 P">
+  <nav id="part-list" class="course-drawer-list" aria-label="课程选集列表">
     {#each filteredParts as part (part.page)}
       {@const savedNote = workspace.courseNotesByPage[Number(part.page)]}
       {@const isCurrent = Number(part.page) === workspace.currentPage}
@@ -77,11 +77,11 @@
           {#if isCurrent}<span class="part-current-state">当前</span>{/if}
         </button>
         {#if savedNote}
-          <button class="part-note-badge" type="button" title="打开该分 P 已保存的笔记" onclick={() => openPartNote(savedNote)}>已记 · 查看</button>
+          <button class="part-note-badge" type="button" title="打开本节已保存的笔记" onclick={() => openPartNote(savedNote)}>已记 · 查看</button>
         {/if}
       </div>
     {:else}
-      <p class="part-empty">{workspace.parts.length ? '没有匹配的分 P。' : '当前视频没有分 P 目录。'}</p>
+      <p class="part-empty">{workspace.parts.length ? '没有匹配的小节。' : '当前视频仅 1 节，无选集目录。'}</p>
     {/each}
   </nav>
 </aside>

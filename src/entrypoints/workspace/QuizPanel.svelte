@@ -1,29 +1,34 @@
 <script lang="ts">
+  import * as ctrl from '../../lib/workspace/controller.ts';
   import * as qz from '../../lib/workspace/quiz.svelte.ts';
+  import { workspace } from '../../lib/workspace/state.svelte.ts';
 
-  let quizSection: HTMLElement | undefined;
-  let lastFocusTrigger = 0;
+  const isGeneratingQuiz = $derived(
+    qz.quizState.generating || (workspace.activeNoteGenerating && workspace.generatingView === 'quiz')
+  );
 
-  $effect(() => {
-    const trigger = qz.quizState.focusTrigger;
-    if (!qz.quizState.visible || trigger <= 0 || trigger === lastFocusTrigger) return;
-    lastFocusTrigger = trigger;
-    requestAnimationFrame(() => {
-      if (quizSection) {
-        window.scrollTo({ top: window.scrollY + quizSection.getBoundingClientRect().top - 24 });
-      }
-    });
-  });
+  function splitInlineCode(text: string): Array<{ code: boolean; value: string }> {
+    const source = String(text || '');
+    const parts: Array<{ code: boolean; value: string }> = [];
+    let offset = 0;
+    for (const match of source.matchAll(/`([^`]+)`/g)) {
+      const idx = match.index || 0;
+      if (idx > offset) parts.push({ code: false, value: source.slice(offset, idx) });
+      parts.push({ code: true, value: match[1]! });
+      offset = idx + match[0].length;
+    }
+    if (offset < source.length) parts.push({ code: false, value: source.slice(offset) });
+    return parts;
+  }
 </script>
 
 <section
-  bind:this={quizSection}
   class="quiz-panel"
-  class:hidden={!qz.quizState.visible}
+  class:hidden={workspace.noteTab !== 'quiz'}
   id="quiz-panel"
   aria-label="随堂自测"
 >
-  <header class="quiz-heading">
+  <header class="quiz-heading" class:hidden={!qz.quizState.hasQuestions}>
     <div>
       <p class="section-label">理解检验</p>
       <h3>随堂自测</h3>
@@ -45,21 +50,31 @@
         type="button"
         disabled={qz.quizState.saving}
         onclick={() => qz.resetAllQuizAnswers()}
-      >{qz.quizState.wrongOnly ? '显示全部重做' : '重新作答'}</button>
+      >{qz.quizState.wrongOnly ? '重做全部题目' : '重新作答'}</button>
       <button
         class="text-button"
-        class:hidden={qz.quizState.isTemplateQuiz}
         id="regenerate-quiz"
         type="button"
-        disabled={qz.quizState.generating}
+        disabled={isGeneratingQuiz || workspace.generating || !qz.quizState.canGenerate}
         onclick={() => qz.generateQuizForActiveNote()}
-      >{qz.quizState.generating ? '正在出题…' : '重新出题'}</button>
-      <button class="text-button" id="close-quiz-panel" type="button" onclick={() => qz.closeQuizPanel()}>收起</button>
+      >{isGeneratingQuiz ? '正在出题…' : '重新出题'}</button>
     </div>
   </header>
 
-  {#if !qz.quizState.questions.length}
-    <p class="quiz-empty">还没有解析出可用的自测题目；点击「生成随堂自测」即可围绕本节内容自动出题。</p>
+  {#if !qz.quizState.hasQuestions}
+    <div class="quiz-empty-card">
+      <div>
+        <strong>{isGeneratingQuiz ? '正在生成本节随堂自测…' : '还没有随堂自测题'}</strong>
+        <p>{isGeneratingQuiz ? '正在结合本节内容设计理解检验单选题，完成后自动展示并保存。' : '结合本节笔记或文字稿自动出 5–8 道理解检验单选题，支持即时解析、错题重做与原视频回看。'}</p>
+      </div>
+      <button
+        class="primary-button quiz-generate-button"
+        id="generate-quiz-empty"
+        type="button"
+        disabled={isGeneratingQuiz || workspace.generating || !qz.quizState.canGenerate}
+        onclick={() => qz.generateQuizForActiveNote()}
+      >{isGeneratingQuiz ? '正在生成自测题…' : '生成本节随堂自测'}</button>
+    </div>
   {:else}
     <ol class="quiz-list">
       {#each qz.quizState.questions as item, index (item.id)}
@@ -68,7 +83,11 @@
         <li class="quiz-card">
           <p class="quiz-question">
             <span class="quiz-index">Q{index + 1}</span>
-            <span>{item.question}</span>
+            <span>
+              {#each splitInlineCode(item.question) as seg}
+                {#if seg.code}<code class="quiz-inline-code">{seg.value}</code>{:else}{seg.value}{/if}
+              {/each}
+            </span>
           </p>
           <div class="quiz-options" role="group" aria-label={`第 ${index + 1} 题选项`}>
             {#each item.options as opt (opt.key)}
@@ -85,11 +104,15 @@
                 onclick={() => qz.selectQuizOption(item.id, opt.key)}
               >
                 <span class="quiz-option-key">{opt.key}</span>
-                <span class="quiz-option-text">{opt.text}</span>
+                <span class="quiz-option-text">
+                  {#each splitInlineCode(opt.text) as seg}
+                    {#if seg.code}<code class="quiz-inline-code">{seg.value}</code>{:else}{seg.value}{/if}
+                  {/each}
+                </span>
                 {#if isCorrect}
                   <span class="quiz-option-badge">正确</span>
                 {:else if isWrongChoice}
-                  <span class="quiz-option-badge">已选</span>
+                  <span class="quiz-option-badge">误选</span>
                 {/if}
               </button>
             {/each}
@@ -98,11 +121,27 @@
             <div class="quiz-explanation" class:is-right={chosen === item.answer}>
               <strong>{chosen === item.answer ? '回答正确' : `回答有误（正确答案：${item.answer}）`}</strong>
               {#if item.explanation}
-                <p>{item.explanation}</p>
+                <p>
+                  {#each splitInlineCode(item.explanation) as seg}
+                    {#if seg.code}<code class="quiz-inline-code">{seg.value}</code>{:else}{seg.value}{/if}
+                  {/each}
+                </p>
               {/if}
-              {#if videoUrl}
-                <a class="quiz-source-link" href={videoUrl} target="_blank" rel="noopener noreferrer">回看原视频讲解 · {item.timestamp} ↗</a>
-              {/if}
+              <div class="quiz-explanation-actions">
+                {#if videoUrl}
+                  <a class="quiz-source-link" href={videoUrl} target="_blank" rel="noopener noreferrer">回看原视频讲解 · {item.timestamp} ↗</a>
+                {/if}
+                <button
+                  type="button"
+                  class="text-button quiz-ask-assistant"
+                  onclick={() => ctrl.askAssistantAboutQuizItem(item, chosen)}
+                >向助教追问 ↗</button>
+                <button
+                  type="button"
+                  class="text-button quiz-ask-assistant"
+                  onclick={() => ctrl.saveQuizItemToPersonalNote(item, chosen)}
+                >📌 记入批注</button>
+              </div>
             </div>
           {/if}
         </li>
@@ -114,9 +153,7 @@
 <style>
   .quiz-panel {
     max-width: 820px;
-    margin: 24px auto 0;
-    border-top: 1px solid var(--border);
-    padding-top: 20px;
+    margin: 16px auto 0;
   }
 
   .quiz-heading {
@@ -151,10 +188,32 @@
     gap: 4px 8px;
   }
 
-  .quiz-empty {
-    margin: 16px 0 0;
+  .quiz-empty-card {
+    display: grid;
+    gap: 16px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+    background: var(--well);
+  }
+
+  .quiz-empty-card strong {
+    display: block;
+    font-size: 16px;
+    font-weight: 600;
+  }
+
+  .quiz-empty-card p {
+    margin: 6px 0 0;
     color: var(--muted);
     font-size: 13px;
+    line-height: 1.6;
+  }
+
+  .quiz-generate-button {
+    width: auto;
+    justify-self: start;
+    margin-top: 0;
   }
 
   .quiz-list {
@@ -191,6 +250,17 @@
     color: var(--accent);
     font-size: 12px;
     font-variant-numeric: tabular-nums;
+  }
+
+  .quiz-inline-code {
+    display: inline-block;
+    margin: 0 2px;
+    padding: 1px 5px;
+    border-radius: 4px;
+    background: rgba(15, 23, 42, 0.06);
+    font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+    font-size: 0.9em;
+    font-weight: 500;
   }
 
   .quiz-options {
@@ -284,13 +354,28 @@
     overflow-wrap: anywhere;
   }
 
+  .quiz-explanation-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 14px;
+    margin-top: 8px;
+  }
+
   .quiz-source-link {
     display: inline-block;
-    margin-top: 8px;
     color: var(--accent);
     font-size: 12px;
     font-weight: 600;
     text-decoration: underline;
+  }
+
+  .quiz-ask-assistant {
+    min-height: 26px;
+    padding: 2px 6px;
+    color: var(--accent);
+    font-size: 12px;
+    font-weight: 600;
   }
 
   @media (max-width: 700px) {

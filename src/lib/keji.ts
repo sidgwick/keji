@@ -1,24 +1,32 @@
 import type { FlashcardReviewState } from "./flashcards.ts";
-import type { TemplateId } from "./note-structures.ts";
+import type { NoteViewKey, TemplateId } from "./note-structures.ts";
 import type { QuizRecordState } from "./quiz.ts";
 
 export type { TemplateId };
-export type ApiProtocol = "openai" | "mimo";
 export type ModelCapability = "text" | "image" | "video_silent" | "video_audio";
 export type DiscussionMode = "qa" | "feynman" | "revise";
+export type ReviewMark = "" | "star" | "question" | "mastered";
+
+export interface ModelPreset {
+  id: string;
+  name: string;
+  baseUrl: string;
+  model: string;
+  modelCapability: ModelCapability;
+  apiKey: string;
+}
 
 export interface KejiSettings {
-  apiProtocol: ApiProtocol;
   baseUrl: string;
   apiKey: string;
   model: string;
   modelCapability: ModelCapability;
+  modelPresets?: ModelPreset[];
+  activePresetId?: string;
   transcriptionEndpoint: string;
   transcriptionModel: string;
-  transcriptionLanguage: string;
   transcriptionPrompt: string;
   transcriptionApiKey: string;
-  transcriptionConcurrency: number | string;
   generationConcurrency: number | string;
   remoteBackupUrl: string;
   remoteBackupUsername: string;
@@ -78,16 +86,19 @@ export interface ConversationItem {
   mode?: DiscussionMode;
   content: string;
   createdAt?: string;
+  requestId?: string;
 }
 
 export interface GenerationProgress {
   completedChunks: number;
   totalChunks: number;
+  chunkMaxChars?: number;
 }
 
 export interface NoteSummary {
   id: string;
   title?: string;
+  courseTitle?: string;
   part?: string;
   url?: string;
   page?: number;
@@ -95,6 +106,12 @@ export interface NoteSummary {
   duration?: number;
   cover?: string;
   template?: TemplateId | string;
+  reviewMark?: ReviewMark;
+  personalNote?: string;
+  viewKeys?: NoteViewKey[];
+  quizSummary?: { total: number; answered: number; correct: number } | null;
+  flashcardSummary?: { total: number; due: number } | null;
+  summaryPreview?: string;
   createdAt?: string;
   updatedAt?: string;
   complete?: boolean;
@@ -106,15 +123,19 @@ export interface NoteSummary {
   generationError?: string;
   generationModel?: string;
   generationModels?: string[];
+  hasContent?: boolean;
   excerpt?: string;
 }
 
 export interface NoteRecord extends NoteSummary {
+  lessonKey?: string;
   customPrompt?: string;
   modelMarkdown?: string;
   transcript?: string;
   transcriptSegments?: TranscriptSegment[];
   detectedLanguages?: string[];
+  views?: Partial<Record<NoteViewKey, string>>;
+  flashcardMarkdown?: string;
   flashcardReview?: FlashcardReviewState[];
   quizState?: QuizRecordState;
   conversation?: ConversationItem[];
@@ -149,17 +170,16 @@ export interface CacheOverview {
 }
 
 const DEFAULT_SETTINGS: KejiSettings = {
-  apiProtocol: "openai",
   baseUrl: "https://api.openai.com/v1",
   apiKey: "",
   model: "",
   modelCapability: "text",
-  transcriptionEndpoint: "",
-  transcriptionModel: "whisper-1",
-  transcriptionLanguage: "",
+  modelPresets: [],
+  activePresetId: "",
+  transcriptionEndpoint: "http://127.0.0.1:11434/api/chat",
+  transcriptionModel: "frozenlab/qwen3-asr:1.7b",
   transcriptionPrompt: "",
   transcriptionApiKey: "",
-  transcriptionConcurrency: 0,
   generationConcurrency: 2,
   remoteBackupUrl: "",
   remoteBackupUsername: "",
@@ -168,6 +188,24 @@ const DEFAULT_SETTINGS: KejiSettings = {
   temperature: 0.3,
   customPrompt: ""
 };
+
+function normalizeOverlapText(input: string): { text: string; ends: number[] } {
+  let text = "";
+  const ends: number[] = [];
+  for (let i = 0; i < input.length; ) {
+    const cp = input.codePointAt(i)!;
+    const ch = String.fromCodePoint(cp);
+    const nextIndex = i + ch.length;
+    if (/[\p{L}\p{N}]/u.test(ch)) {
+      for (const unit of ch.toLowerCase()) {
+        text += unit;
+        ends.push(nextIndex);
+      }
+    }
+    i = nextIndex;
+  }
+  return { text, ends };
+}
 
 export const Keji = {
   defaultSettings: DEFAULT_SETTINGS,
@@ -193,10 +231,89 @@ export const Keji = {
       : `${String(minutes).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
   },
 
-  normalizeProtocol(protocol: unknown, baseUrl = ""): ApiProtocol {
-    if (protocol === "mimo") return "mimo";
-    if (protocol === "openai") return "openai";
-    return /xiaomimimo\.com/i.test(String(baseUrl || "")) ? "mimo" : "openai";
+  resolveAsrEndpoint(raw: unknown): string {
+    const trimmed = String(raw || "").trim().replace(/\/+$/, "");
+    if (!trimmed) return DEFAULT_SETTINGS.transcriptionEndpoint;
+    if (/\/(?:api\/chat|chat\/completions)$/i.test(trimmed)) return trimmed;
+    try {
+      const url = new URL(trimmed);
+      if (!url.pathname || url.pathname === "/") return `${trimmed}/api/chat`;
+    } catch {
+      return trimmed;
+    }
+    return `${trimmed}/chat/completions`;
+  },
+
+  parseAsrText(raw: unknown): { text: string; language: string } {
+    const cleaned = String(raw || "")
+      .replace(/<think>[\s\S]*?<\/think>/gi, "")
+      .replace(/<\|im_end\|>/g, "")
+      .trim();
+    const match = cleaned.match(/^(?:language\s+([^\n<]+?)\s*)?<asr_text>([\s\S]*)$/i);
+    if (!match) return { text: cleaned, language: "" };
+    const rawLang = String(match[1] || "").trim();
+    const language = /^none$/i.test(rawLang) ? "" : rawLang;
+    return { text: String(match[2] || "").trim(), language };
+  },
+
+  dedupeTranscriptOverlap(prevText: string, nextText: string): string {
+    const rawNext = String(nextText || "").trim();
+    const prevNorm = normalizeOverlapText(String(prevText || ""));
+    const nextNorm = normalizeOverlapText(rawNext);
+    if (!prevNorm.text || !nextNorm.text) return rawNext;
+
+    const prevTail = prevNorm.text.slice(-36);
+    const nextHead = nextNorm.text.slice(0, 36);
+    const minOverlapFor = (candidate: string, strict: boolean) =>
+      (/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(candidate) ? (strict ? 3 : 2) : (strict ? 6 : 5));
+
+    let bestMatchLen = 0;
+    let bestCutLen = 0;
+    for (let nextOffset = 0; nextOffset <= Math.min(3, nextHead.length); nextOffset += 1) {
+      const maxLen = Math.min(prevTail.length, nextHead.length - nextOffset);
+      for (let len = maxLen; len >= 2; len -= 1) {
+        const candidate = nextHead.slice(nextOffset, nextOffset + len);
+        if (len < minOverlapFor(candidate, nextOffset > 0)) continue;
+        if (prevTail.endsWith(candidate) && len > bestMatchLen) {
+          bestMatchLen = len;
+          bestCutLen = nextOffset + len;
+          break;
+        }
+      }
+    }
+
+    if (bestCutLen === 0) {
+      for (let prevGap = 1; prevGap <= Math.min(2, Math.max(0, prevTail.length - 2)); prevGap += 1) {
+        const trimmedPrev = prevTail.slice(0, prevTail.length - prevGap);
+        const maxLen = Math.min(trimmedPrev.length, nextHead.length);
+        for (let len = maxLen; len >= 3; len -= 1) {
+          const candidate = nextHead.slice(0, len);
+          if (len < minOverlapFor(candidate, true)) continue;
+          if (trimmedPrev.endsWith(candidate) && len > bestMatchLen) {
+            bestMatchLen = len;
+            bestCutLen = len;
+            break;
+          }
+        }
+      }
+    }
+
+    if (bestCutLen === 0) return rawNext;
+    if (bestCutLen >= nextNorm.text.length) return "";
+    return rawNext
+      .slice(nextNorm.ends[bestCutLen - 1]!)
+      .replace(/^[\s，,。\.、；;：:！？!?\-—·]+/u, "")
+      .trim();
+  },
+
+  normalizeTranscriptionPrompt(value: unknown): string {
+    return String(value || "")
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean)
+      .join(", ")
+      .slice(0, 200)
+      .replace(/[\s,]+$/, "");
   },
 
   normalizeCapability(capability: unknown, legacyVideoMode?: unknown): ModelCapability {
@@ -231,8 +348,76 @@ export const Keji = {
   lessonKey(target?: VideoTarget | null): string {
     const bvid = String(target?.bvid || this.bvidFromUrl(target?.url || "")).trim().toUpperCase();
     if (!/^BV[\w]+$/i.test(bvid)) return "";
-    const page = Math.max(1, Math.floor(Number(target?.page) || 1));
+    let pageNum = Number(target?.page) || 0;
+    if (!pageNum && target?.url) {
+      try {
+        pageNum = Number(new URL(target.url).searchParams.get("p")) || 0;
+      } catch {
+        pageNum = 0;
+      }
+    }
+    const page = Math.max(1, Math.floor(pageNum || 1));
     return `${bvid}:${page}`;
+  },
+
+  cleanPartTitle(part?: string | null, page?: number | null): string {
+    let text = String(part || "").trim();
+    if (!text) return "";
+    if (/^(?:P\s*\d+|第\s*\d+\s*[讲节集课]?)$/i.test(text)) return "";
+    const pageNum = Math.max(0, Math.floor(Number(page) || 0));
+    for (let pass = 0; pass < 3; pass += 1) {
+      const stripP = text.replace(/^P\s*\d+\s*(?:[·•:：\-—|、._]+\s*|\s+(?=\S))/i, "").trim();
+      const stripSec = stripP.replace(/^第\s*\d+\s*[讲节集课篇话]\s*[·•:：\-—|、._\s]*/i, "").trim();
+      const numMatch = stripSec.match(/^0*(\d{1,3})\s*(?:[.、:：_\-—)\]]+\s*|\s+(?=[^\d\s]))(.*)$/);
+      let next = stripSec;
+      if (numMatch && numMatch[2]!.trim()) {
+        const prefixNum = Number(numMatch[1]);
+        if (!pageNum || prefixNum === pageNum || prefixNum <= 999) {
+          next = numMatch[2]!.trim();
+        }
+      }
+      if (!next || next === text) break;
+      text = next;
+    }
+    return text;
+  },
+
+  formatEpisodeHeading(target?: {
+    title?: string;
+    courseTitle?: string;
+    part?: string;
+    page?: number;
+    pageCount?: number;
+  } | null): {
+    mainTitle: string;
+    courseTitle: string;
+    courseLabel: string;
+    isMultiPart: boolean;
+  } {
+    const rawTitle = String(target?.title || "").trim();
+    const rawCourse = String(target?.courseTitle || "").trim();
+    const page = Math.max(1, Math.floor(Number(target?.page) || 1));
+    const pageCount = Math.max(1, Math.floor(Number(target?.pageCount) || 1));
+    const cleanPart = this.cleanPartTitle(target?.part, page);
+    const courseTitle = rawCourse || rawTitle || "未命名课程";
+    const isMultiPart = pageCount > 1 || Boolean(cleanPart && courseTitle && cleanPart !== courseTitle);
+    if (!isMultiPart) {
+      return {
+        mainTitle: rawTitle || cleanPart || "课程笔记",
+        courseTitle,
+        courseLabel: ""
+        ,
+        isMultiPart: false
+      };
+    }
+    const defaultEpisodeTitle = cleanPart
+      ? `P${page} · ${cleanPart}`
+      : `第 ${page} 讲 · ${courseTitle}`;
+    const hasCustomEpisodeTitle = Boolean(rawCourse && rawTitle && rawTitle !== rawCourse);
+    const mainTitle = hasCustomEpisodeTitle ? rawTitle : defaultEpisodeTitle;
+    const progressPart = pageCount > 1 ? `第 ${page}/${pageCount} 讲` : `第 ${page} 讲`;
+    const courseLabel = [courseTitle, progressPart].filter(Boolean).join(" · ");
+    return { mainTitle, courseTitle, courseLabel, isMultiPart: true };
   },
 
   generationBatches(totalChunks: number, concurrency = 2, startAt = 0): number[][] {
@@ -252,7 +437,7 @@ export const Keji = {
     indexes: number[],
     initialMarkdown: string,
     generateChunk: (index: number, seedMarkdown: string) => Promise<T>,
-    mergeMarkdown: (previousMarkdown: string, chunkMarkdown: string) => string,
+    mergeMarkdown: (previousMarkdown: string, chunkMarkdown: string, value: T) => string,
     onCommit: (info: { index: number; markdown: string; committed: number; value: T }) => Promise<void> = async () => {}
   ) {
     const orderedIndexes = Array.isArray(indexes) ? indexes : [];
@@ -276,7 +461,7 @@ export const Keji = {
         while (committed < results.length) {
           const item = results[committed];
           if (!item || item.status !== "fulfilled") return;
-          const nextMarkdown = mergeMarkdown(markdown, item.value.markdown!);
+          const nextMarkdown = mergeMarkdown(markdown, item.value.markdown!, item.value);
           const nextCommitted = committed + 1;
           await onCommit({
             index: orderedIndexes[committed]!,
@@ -336,6 +521,52 @@ export const Keji = {
     }
     if (current) chunks.push(current);
     return chunks.length ? chunks : [source];
+  },
+
+  parseContextOverflowError(message: unknown): {
+    isOverflow: boolean;
+    requestTokens: number | null;
+    contextLimit: number | null;
+  } {
+    const text = String(message || "");
+    const llamaMatch = text.match(/request\s*\(\s*(\d+)\s*tokens?\s*\)\s*exceeds[\s\S]*?context\s+size\s*\(\s*(\d+)\s*tokens?\s*\)/i);
+    if (llamaMatch) {
+      return {
+        isOverflow: true,
+        requestTokens: Number(llamaMatch[1]) || null,
+        contextLimit: Number(llamaMatch[2]) || null,
+      };
+    }
+    const openaiMatch = text.match(/maximum\s+context\s+length\s+is\s+(\d+)\s*tokens?[\s\S]*?(?:resulted\s+in|requested)\s+(\d+)\s*tokens?/i);
+    if (openaiMatch) {
+      return {
+        isOverflow: true,
+        requestTokens: Number(openaiMatch[2]) || null,
+        contextLimit: Number(openaiMatch[1]) || null,
+      };
+    }
+    const isOverflow = /context_length_exceeded|exceeds?\s+(?:the\s+)?(?:available\s+)?context|maximum\s+context\s+length|context\s+window|too\s+many\s+tokens|prompt\s+is\s+too\s+long|input\s+is\s+too\s+long/i.test(text);
+    return { isOverflow, requestTokens: null, contextLimit: null };
+  },
+
+  computeAdaptiveChunkChars(
+    currentChunkChars: number,
+    overflow: { requestTokens: number | null; contextLimit: number | null }
+  ): number | null {
+    const current = Math.max(1000, Math.floor(Number(currentChunkChars) || 12000));
+    if (current <= 1000) return null;
+    if (overflow.requestTokens && overflow.contextLimit && overflow.requestTokens > 0 && overflow.contextLimit > 0) {
+      const outputReserve = Math.min(2400, Math.max(800, Math.floor(overflow.contextLimit * 0.35)));
+      const promptOverhead = Math.min(650, Math.floor(overflow.contextLimit * 0.2));
+      const budgetTokens = overflow.contextLimit - outputReserve - promptOverhead;
+      if (budgetTokens < 350) return null;
+      const tokensPerChar = Math.max(0.25, overflow.requestTokens / current);
+      const estimated = Math.floor((budgetTokens / tokensPerChar) * 0.88);
+      const next = Math.max(1000, Math.min(current - 1000, estimated));
+      return next >= current ? null : next;
+    }
+    const next = Math.max(1000, Math.floor(current * 0.5));
+    return next < current ? next : null;
   },
 
   audioChunkRanges(durationSeconds: number, maxChunkSeconds = 600): Array<{ index: number; start: number; end: number }> {

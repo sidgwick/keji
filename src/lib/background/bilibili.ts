@@ -16,6 +16,8 @@ interface InspectBilibiliOptions {
   preferredLanguage?: string;
   streamKind?: "audio" | "video";
   targetBytes?: number;
+  requestedBvid?: string;
+  requestedPage?: number;
 }
 
 function pageFromUrl(url: string): number {
@@ -178,6 +180,11 @@ async function inspectBilibiliPage<T = Record<string, any>>(tabId: number, optio
 
       const urlBvid = String(loc?.pathname || "").match(/\/video\/(BV[\w]+)/i)?.[1] || "";
       const urlPage = Math.max(0, Number(new URLSearchParams(loc?.search || "").get("p")) || 0);
+      const requestedBvid = String(opts.requestedBvid || "").trim().toUpperCase();
+      const requestedPage = Math.max(0, Number(opts.requestedPage) || 0);
+      if (requestedBvid && urlBvid && urlBvid.toUpperCase() !== requestedBvid) {
+        return { error: "B 站标签页已切换到其他视频，请重新载入当前课程。" };
+      }
       const state = win.__INITIAL_STATE__;
       const stateData = state?.videoData;
       const stateBvid = String(stateData?.bvid || state?.bvid || "");
@@ -193,12 +200,18 @@ async function inspectBilibiliPage<T = Record<string, any>>(tabId: number, optio
       }
       if (!data) return { error: "当前页面还没有加载出视频信息，请稍后重试。" };
 
-      const pageNo = urlPage >= 1 ? urlPage : Math.max(1, Number(state?.p) || 1);
-      const page = data.pages?.[pageNo - 1] || data;
       const bvid = String(data.bvid || urlBvid || stateBvid || "");
+      if (requestedBvid && bvid.toUpperCase() !== requestedBvid) {
+        return { error: "B 站标签页与目标课程不一致，请重新载入当前课程。" };
+      }
+      const pageNo = requestedPage >= 1
+        ? requestedPage
+        : (urlPage >= 1 ? urlPage : Math.max(1, Number(state?.p) || 1));
+      const page = data.pages?.[pageNo - 1] || (pageNo === 1 ? data : null);
+      if (!page) return { error: `找不到第 ${pageNo} 节的视频分 P 信息。` };
       const aid = Number(data.aid || state?.aid) || 0;
       const expectedCid = Number(page?.cid || (pageNo === 1 ? state?.cid || data.cid : 0)) || 0;
-      const pageDuration = Number(page?.duration || data.duration) || 0;
+      const pageDuration = Number(page?.duration || (pageNo === 1 ? data.duration : 0)) || 0;
       const perfEntries = (perf?.getEntriesByType?.("resource") || []) as Array<{ name: string }>;
 
       if (opts.mode === "dash") {
@@ -278,6 +291,7 @@ async function inspectBilibiliPage<T = Record<string, any>>(tabId: number, optio
           if (
             sameInitialBvid
             && sameInitialPage
+            && (!urlPage || urlPage === pageNo)
             && sameInitialCid
             && !switchedOtherCid
             && durationOk
@@ -396,6 +410,8 @@ async function inspectBilibiliPage<T = Record<string, any>>(tabId: number, optio
         const coverUrl = new URL(data.pic, loc.origin);
         if (coverUrl.protocol === "https:") cover = coverUrl.href;
       } catch {}
+      const targetUrl = new URL(`${loc.origin}${loc.pathname}${loc.search}`);
+      if (requestedPage >= 1 || urlPage >= 1) targetUrl.searchParams.set("p", String(pageNo));
       const video = {
         bvid,
         aid,
@@ -406,7 +422,7 @@ async function inspectBilibiliPage<T = Record<string, any>>(tabId: number, optio
         pageCount: data.pages?.length || 1,
         cid: expectedCid,
         duration: pageDuration,
-        url: `${loc.origin}${loc.pathname}${loc.search}`
+        url: targetUrl.toString()
       };
       const parts = (data.pages || [page]).map((part: any, index: number) => {
         const partUrl = new URL(loc.href);
@@ -514,14 +530,22 @@ async function inspectBilibiliPage<T = Record<string, any>>(tabId: number, optio
   return payload as T;
 }
 
-export async function readCurrentVideo(tabId?: number | null, preferredSubtitleLanguage = "") {
-  const tab = await getVideoTab(tabId);
+export async function readCurrentVideo(
+  tabId?: number | null,
+  preferredSubtitleLanguage = "",
+  lessonHint: VideoTarget | null = null
+): Promise<{ video: VideoTarget; tabId: number; windowId?: number; [key: string]: any }> {
+  const hintBvid = (Keji.bvidFromUrl(lessonHint?.url || "") || String(lessonHint?.bvid || "").trim()).toUpperCase();
+  const hintPage = Math.max(0, Number(lessonHint?.page) || 0);
+  const tab = await getVideoTab(tabId, lessonHint);
   const payload = await inspectBilibiliPage<Record<string, any>>(tab.id, {
     mode: "meta",
-    preferredLanguage: String(preferredSubtitleLanguage || "")
+    preferredLanguage: String(preferredSubtitleLanguage || ""),
+    ...(hintBvid ? { requestedBvid: hintBvid } : {}),
+    ...(hintPage ? { requestedPage: hintPage } : {})
   });
   if (!payload?.video) throw new Error("无法读取 B 站页面信息。");
-  return { ...payload, tabId: tab.id, windowId: tab.windowId };
+  return { ...payload, video: payload.video as VideoTarget, tabId: tab.id, windowId: tab.windowId };
 }
 
 export async function readCurrentDashSource(
@@ -530,13 +554,23 @@ export async function readCurrentDashSource(
   maxTargetBytes = 0,
   lessonHint: VideoTarget | null = null
 ): Promise<Record<string, any>> {
+  const hintBvid = (Keji.bvidFromUrl(lessonHint?.url || "") || String(lessonHint?.bvid || "").trim()).toUpperCase();
+  const hintPage = Math.max(0, Number(lessonHint?.page) || 0);
   const tab = await getVideoTab(tabId, lessonHint);
   const source = await inspectBilibiliPage<Record<string, any>>(tab.id, {
     mode: "dash",
     streamKind: kind,
-    targetBytes: Math.max(0, Number(maxTargetBytes) || 0)
+    targetBytes: Math.max(0, Number(maxTargetBytes) || 0),
+    ...(hintBvid ? { requestedBvid: hintBvid } : {}),
+    ...(hintPage ? { requestedPage: hintPage } : {})
   });
   if (!source?.url) throw new Error(kind === "audio" ? "无法读取 B 站音轨地址，请稍后重试。" : "无法读取 B 站视频流地址。");
+  if (hintBvid && String(source.bvid || "").toUpperCase() !== hintBvid) {
+    throw new Error("读取媒体流时视频与当前课程不一致，请重新载入后重试。");
+  }
+  if (hintPage >= 1 && Number(source.page) !== hintPage) {
+    throw new Error("读取媒体流时当前分 P 发生了切换，请重新载入后重试。");
+  }
   if (kind === "video" && !isBilibiliCdnUrl(source.url, true)) {
     throw new Error("B 站返回了无法识别的视频 CDN 地址。");
   }
@@ -570,12 +604,39 @@ export async function configureBilibiliCdnRequestHeaders(origin = "https://www.b
 }
 
 export async function resolveValidatedAudioTrack(tabId?: number | null, lessonHint: VideoTarget | null = null) {
+  const hintKey = Keji.lessonKey(lessonHint);
+  if (lessonHint && hintKey) {
+    const cachedHintAudio = await getCachedAudio(lessonHint, { expectedCid: Number(lessonHint.cid) || 0 }).catch(() => null);
+    if (cachedHintAudio) {
+      const videoPayload = {
+        bvid: cachedHintAudio.meta?.bvid || lessonHint.bvid || Keji.bvidFromUrl(lessonHint.url || ""),
+        page: Number(cachedHintAudio.meta?.page || lessonHint.page) || 1,
+        cid: Number(cachedHintAudio.meta?.cid || lessonHint.cid) || 0,
+        title: cachedHintAudio.meta?.title || lessonHint.title || "未命名视频",
+        part: cachedHintAudio.meta?.part || lessonHint.part || "当前分 P",
+        duration: Number(cachedHintAudio.meta?.duration || lessonHint.duration) || 0,
+        url: cachedHintAudio.meta?.url || lessonHint.url || ""
+      };
+      return {
+        cachedAudio: true,
+        videoPayload,
+        audioSource: {
+          duration: Number(videoPayload.duration) || 0,
+          bvid: videoPayload.bvid,
+          page: videoPayload.page,
+          part: videoPayload.part,
+          expectedCid: videoPayload.cid
+        }
+      };
+    }
+  }
+
   let tab: (chrome.tabs.Tab & { id: number; url: string }) | null = null;
   let videoInfo: any = null;
   let liveError: Error | null = null;
   try {
     tab = await getVideoTab(tabId, lessonHint);
-    videoInfo = await readCurrentVideo(tab.id);
+    videoInfo = await readCurrentVideo(tab.id, "", lessonHint);
   } catch (error) {
     liveError = error as Error;
   }
@@ -607,6 +668,12 @@ export async function resolveValidatedAudioTrack(tabId?: number | null, lessonHi
     };
   }
   if (liveError || !tab || !videoInfo) throw liveError || new Error("请载入一个 B 站视频链接。");
+  const hintBvid = (Keji.bvidFromUrl(lessonHint?.url || "") || String(lessonHint?.bvid || "").trim()).toUpperCase();
+  const hintPage = Math.max(0, Number(lessonHint?.page) || 0);
+  if ((hintBvid && String(videoInfo.video.bvid || "").toUpperCase() !== hintBvid)
+      || (hintPage >= 1 && Number(videoInfo.video.page) !== hintPage)) {
+    throw new Error("读取音轨期间目标课程分 P 与播放页不一致，请重新载入课程后再试。");
+  }
   const audioSource = await readCurrentDashSource(tab.id, "audio", 0, videoInfo.video);
   if (audioSource.bvid !== videoInfo.video.bvid
       || Number(audioSource.page) !== Number(videoInfo.video.page)

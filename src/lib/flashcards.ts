@@ -29,6 +29,7 @@ interface FlashcardSourceNote {
   url?: string;
   template?: string;
   markdown: string;
+  flashcardMarkdown?: string;
   flashcardReview?: FlashcardReviewState[];
 }
 
@@ -220,13 +221,14 @@ export function collectFlashcardsFromNotes(
 ): FlashcardItem[] {
   const cards: FlashcardItem[] = [];
   for (const note of notes) {
-    if (!getNoteStructure(note.template).supportsFlashcards && !hasFlashcardTableCandidate(note.markdown)) {
+    const sourceMd = note.flashcardMarkdown || note.markdown;
+    if (!note.flashcardMarkdown && !getNoteStructure(note.template).supportsFlashcards && !hasFlashcardTableCandidate(note.markdown)) {
       continue;
     }
     const dueById = new Map(
       (Array.isArray(note.flashcardReview) ? note.flashcardReview : []).map((item) => [item.id, item])
     );
-    for (const card of parseFlashcards(note.markdown)) {
+    for (const card of parseFlashcards(sourceMd)) {
       const reviewState = dueById.get(card.id) || {
         id: card.id,
         ease: DEFAULT_EASE,

@@ -1,6 +1,7 @@
 import { workspace } from './state.svelte.ts';
 
 let noticeTimer: ReturnType<typeof setTimeout> | null = null;
+let noticeActionCallback: (() => void) | null = null;
 
 export function callBackground(type: string, payload: Record<string, unknown> = {}) {
   return chrome.runtime.sendMessage({ type, ...payload });
@@ -9,19 +10,33 @@ export function callBackground(type: string, payload: Record<string, unknown> = 
 export function dismissNotice(): void {
   if (noticeTimer) clearTimeout(noticeTimer);
   noticeTimer = null;
-  workspace.notice = { message: '', kind: 'info' };
+  noticeActionCallback = null;
+  workspace.notice = { message: '', kind: 'info', actionLabel: '' };
 }
 
-export function showNotice(message: string, kind: 'info' | 'success' | 'error' = 'info'): void {
+export function triggerNoticeAction(): void {
+  const fn = noticeActionCallback;
+  dismissNotice();
+  fn?.();
+}
+
+export function showNotice(
+  message: string,
+  kind: 'info' | 'success' | 'error' = 'info',
+  options: { actionLabel?: string; onAction?: () => void; durationMs?: number } = {},
+): void {
   if (noticeTimer) clearTimeout(noticeTimer);
   noticeTimer = null;
+  noticeActionCallback = options.onAction || null;
   const text = String(message || '');
-  workspace.notice = { message: text, kind };
-  if (text && kind !== 'error') {
+  workspace.notice = { message: text, kind, actionLabel: options.actionLabel || '' };
+  const durationMs = options.durationMs ?? (kind !== 'error' ? 3600 : 0);
+  if (text && durationMs > 0) {
     noticeTimer = setTimeout(() => {
-      workspace.notice = { message: '', kind: 'info' };
+      workspace.notice = { message: '', kind: 'info', actionLabel: '' };
       noticeTimer = null;
-    }, 3000);
+      noticeActionCallback = null;
+    }, durationMs);
   }
 }
 

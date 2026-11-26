@@ -38,7 +38,10 @@ export function mergeMarkdownSections(markdowns: string[]): string {
       while (stack.at(-1)!.level >= level) stack.pop();
       const parent = stack.at(-1)!;
       const title = heading[2]!.trim();
-      const key = title.toLocaleLowerCase().replace(/\s+/g, " ");
+      const key = title
+        .replace(/\s*\[\d{1,2}:\d{2}(?::\d{2})?\]\s*$/g, "")
+        .toLocaleLowerCase()
+        .replace(/\s+/g, " ");
       let section = parent.childIndex.get(key);
       if (!section) {
         section = { level, title, content: [], children: [], childIndex: new Map() };
@@ -75,11 +78,76 @@ export function noteExcerpt(markdown?: string): string {
 }
 
 export function formatNoteMarkdown(title: string, video: VideoTarget, bodyMarkdown: string): string {
-  return `# ${title}\n\n> ${video.part || "当前分 P"} · 第 ${video.page || 1}/${video.pageCount || 1} 节 · [视频链接](${video.url || ""})\n\n${bodyMarkdown}`;
+  const heading = Keji.formatEpisodeHeading({
+    title,
+    courseTitle: video?.title,
+    part: video?.part,
+    page: video?.page,
+    pageCount: video?.pageCount,
+  });
+  const metaParts = [
+    heading.courseLabel || Keji.cleanPartTitle(video?.part, video?.page) || "课程笔记",
+    video?.url ? `[视频链接](${video.url})` : "",
+  ].filter(Boolean);
+  return `# ${heading.mainTitle}\n\n> ${metaParts.join(" · ")}\n\n${bodyMarkdown}`;
 }
 
 export function noteBodyMarkdown(markdown: string): string {
   return String(markdown || "").replace(/^#[^\n]*\n\n>[^\n]*\n\n/, "");
+}
+
+export function extractNoteSummaryPreview(markdown?: string): string {
+  const body = noteBodyMarkdown(String(markdown || ""))
+    .replace(/!\[([^\]]*)\]\(data:image\/[^;]+;base64,[^)]+\)/g, " ")
+    .replace(/\[\[KEYFRAME:[^\]]+\]\]/gi, " ")
+    .replace(/```[\s\S]*?```/g, " ");
+  const lines = body
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !/^#{1,6}\s*(?:核心提要|核心主旨|核心公式与速查|实操目标|前置准备)?\s*$/.test(line) && !/^\|/.test(line));
+  const candidate = lines.find((line) => line.length >= 6) || lines[0] || "";
+  if (!candidate) return "";
+  const cleaned = candidate
+    .replace(/^\s{0,3}(?:>\s?|[-*+]\s+|\d+[.)]\s+)/, "")
+    .replace(/\*\*(?:核心问题|核心主旨|全片主线|内容提要)\*\*\s*[：:]\s*/g, "")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/\[\d{1,2}:\d{2}(?::\d{2})?\]/g, "")
+    .replace(/[`*_~]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return cleaned.length > 96 ? `${cleaned.slice(0, 95)}…` : cleaned;
+}
+
+export function foldMarkdownImagesForEdit(markdown: string): {
+  draft: string;
+  imageMap: Map<string, string>;
+} {
+  const imageMap = new Map<string, string>();
+  let index = 0;
+  const draft = String(markdown || "").replace(
+    /!\[([^\]]*)\]\((data:image\/(?:jpeg|png|webp);base64,[A-Za-z0-9+/=]+)\)/gi,
+    (_whole, alt: string, dataUrl: string) => {
+      index += 1;
+      const token = `keji-frame://${index}`;
+      imageMap.set(token, dataUrl);
+      return `![${alt}](${token})`;
+    }
+  );
+  return { draft, imageMap };
+}
+
+export function unfoldMarkdownImagesFromEdit(
+  draft: string,
+  imageMap: Map<string, string>
+): string {
+  if (!imageMap || !imageMap.size) return String(draft || "");
+  return String(draft || "").replace(
+    /!\[([^\]]*)\]\((keji-frame:\/\/\d+)\)/gi,
+    (whole, alt: string, token: string) => {
+      const dataUrl = imageMap.get(token);
+      return dataUrl ? `![${alt}](${dataUrl})` : whole;
+    }
+  );
 }
 
 export function restoreScreenshotEmbeds(updatedMarkdown: string, previousMarkdown: string): string {
@@ -136,7 +204,7 @@ export function renderMarkdownPreview(markdown: string, sourceVideo: VideoTarget
   const lines = String(markdown || "").split(/\r?\n/);
 
   const appendInline = (parent: HTMLElement, source: string) => {
-    const pattern = /(!\[([^\]]*)\]\(([^)\s]+)\)|\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)|`([^`]+)`|\$([^\s$][^$\n]*?[^\s$]|[^\s$])\$|\*\*([^*]+)\*\*|\*([^*]+)\*|\[(\d{1,2}:\d{2}(?::\d{2})?)\])/g;
+    const pattern = /(!\[([^\]]*)\]\(([^)\s]+)\)|\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)|`([^`]+)`|\$\$([^$\n]+?)\$\$|\$([^\s$][^$\n]*?[^\s$]|[^\s$])\$|\*\*([^*]+)\*\*|\*([^*]+)\*|\[(\d{1,2}:\d{2}(?::\d{2})?)\])/g;
     let offset = 0;
     for (const match of source.matchAll(pattern)) {
       parent.append(document.createTextNode(source.slice(offset, match.index)));
@@ -155,20 +223,20 @@ export function renderMarkdownPreview(markdown: string, sourceVideo: VideoTarget
         link.rel = "noopener noreferrer";
         link.textContent = match[4];
         parent.append(link);
-      } else if (match[10]) {
-        parent.append(createTimestampNode(match[10], sourceVideo?.url));
+      } else if (match[11]) {
+        parent.append(createTimestampNode(match[11], sourceVideo?.url));
       } else if (match[6]) {
         const code = document.createElement("code");
         code.textContent = match[6];
         parent.append(code);
-      } else if (match[7]) {
+      } else if (match[7] || match[8]) {
         const math = document.createElement("code");
         math.className = "math-inline";
-        math.textContent = match[7];
+        math.textContent = (match[7] || match[8] || "").trim();
         parent.append(math);
       } else {
-        const emphasis = document.createElement(match[8] ? "strong" : "em");
-        emphasis.textContent = match[8] || match[9] || "";
+        const emphasis = document.createElement(match[9] ? "strong" : "em");
+        emphasis.textContent = match[9] || match[10] || "";
         parent.append(emphasis);
       }
       offset = (match.index || 0) + match[0].length;
@@ -176,25 +244,76 @@ export function renderMarkdownPreview(markdown: string, sourceVideo: VideoTarget
     parent.append(document.createTextNode(source.slice(offset)));
   };
 
-  const startsBlock = (line: string) => /^(?:#{1,6}\s|```|\$\$|\s*>|\s*[-*+]\s+|\s*\d+[.)]\s+|\s*(?:---+|___+|\*\*\*+)\s*$)/.test(line);
+  const startsBlock = (line: string) => /^(?:#{1,6}\s|\s*(?:`{3,}|~{3,})|\s*\$\$|\s*>|\s*[-*+]\s+|\s*\d+[.)]\s+|\s*(?:---+|___+|\*\*\*+)\s*$)/.test(line);
   const isTableRule = (line: string) => /^\s*\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)+\|?\s*$/.test(line);
   const tableCells = (line: string) => line.trim().replace(/^\||\|$/g, "").split(/(?<!\\)\|/).map((cell) => cell.replace(/\\\|/g, "|").trim());
   const listPattern = /^(\s*)([-*+]\s+|\d+[.)]\s+)(.*)$/;
+  const standaloneImagePattern = /^\s*!\[([^\]]*)\]\((data:image\/(?:jpeg|png|webp);base64,[A-Za-z0-9+/=]+)\)\s*$/i;
+  const legacyFrameQuotePattern = /^\s*>\s*\*\*画面要点\s*·[^*]+\*\*[：:]/;
+
+  const consumeFencedCodeBlock = (startIndex: number): { pre: HTMLPreElement; nextIndex: number } => {
+    const opener = lines[startIndex]!;
+    const indent = (opener.match(/^(\s*)/)?.[1] || "").length;
+    const marker = opener.trim().match(/^(`{3,}|~{3,})/)?.[1]?.[0] || "`";
+    const closeRe = new RegExp(`^\\s*${marker === "`" ? "`" : "~"}{3,}\\s*$`);
+    const codeLines: string[] = [];
+    let cursor = startIndex + 1;
+    while (cursor < lines.length && !closeRe.test(lines[cursor]!)) {
+      const rawLine = lines[cursor++]!;
+      let strip = 0;
+      while (strip < indent && rawLine[strip] === " ") strip += 1;
+      codeLines.push(rawLine.slice(strip));
+    }
+    if (cursor < lines.length) cursor += 1;
+    const pre = document.createElement("pre");
+    const code = document.createElement("code");
+    code.textContent = codeLines.join("\n");
+    pre.append(code);
+    return { pre, nextIndex: cursor };
+  };
+
+  const appendFigureBlock = (alt: string, dataUrl: string) => {
+    const figure = document.createElement("figure");
+    figure.className = "note-figure";
+    const image = document.createElement("img");
+    image.src = dataUrl;
+    image.alt = alt;
+    image.loading = "lazy";
+    figure.append(image);
+
+    const tsMatch = alt.match(/\s*(?:·|\||\[)?\s*(\d{1,2}:\d{2}(?::\d{2})?)\]?\s*$/);
+    const caption = tsMatch ? alt.slice(0, tsMatch.index).trim() : alt.trim();
+    const timestamp = tsMatch?.[1] || "";
+    if (caption || timestamp) {
+      const figcaption = document.createElement("figcaption");
+      figcaption.className = "note-figcaption";
+      figcaption.append(document.createTextNode("图"));
+      if (timestamp) {
+        figcaption.append(document.createTextNode(" · "));
+        figcaption.append(createTimestampNode(timestamp, sourceVideo?.url));
+      }
+      if (caption) {
+        figcaption.append(document.createTextNode(` · ${caption}`));
+      }
+      figure.append(figcaption);
+    }
+    root.append(figure);
+  };
 
   let index = 0;
   while (index < lines.length) {
     const line = lines[index]!;
     if (!line.trim()) { index += 1; continue; }
-    if (/^```/.test(line)) {
-      const codeLines: string[] = [];
+    const standaloneImg = line.match(standaloneImagePattern);
+    if (standaloneImg) {
+      appendFigureBlock(standaloneImg[1] || "", standaloneImg[2]!);
       index += 1;
-      while (index < lines.length && !/^```/.test(lines[index]!)) codeLines.push(lines[index++]!);
-      if (index < lines.length) index += 1;
-      const pre = document.createElement("pre");
-      const code = document.createElement("code");
-      code.textContent = codeLines.join("\n");
-      pre.append(code);
+      continue;
+    }
+    if (/^\s*(?:`{3,}|~{3,})/.test(line)) {
+      const { pre, nextIndex } = consumeFencedCodeBlock(index);
       root.append(pre);
+      index = nextIndex;
       continue;
     }
     if (/^\s*\$\$/.test(line)) {
@@ -216,7 +335,14 @@ export function renderMarkdownPreview(markdown: string, sourceVideo: VideoTarget
     }
     const heading = line.match(/^(#{1,6})\s+(.+)$/);
     if (heading) {
-      const node = document.createElement(`h${heading[1]!.length}`);
+      const level = heading[1]!.length;
+      const node = document.createElement(`h${level}`);
+      if (
+        level === 1
+        && [...root.children].every((el) => el.tagName === "H1" || el.classList.contains("note-meta-quote"))
+      ) {
+        node.className = "note-leading-title";
+      }
       appendInline(node, heading[2]!);
       root.append(node);
       index += 1;
@@ -249,11 +375,32 @@ export function renderMarkdownPreview(markdown: string, sourceVideo: VideoTarget
       continue;
     }
     if (/^\s*>/.test(line)) {
-      const quote = document.createElement("blockquote");
+      const quoteLines: string[] = [];
       while (index < lines.length && /^\s*>/.test(lines[index]!)) {
+        quoteLines.push(lines[index++]!);
+      }
+      let nextNonEmpty = index;
+      while (nextNonEmpty < lines.length && !lines[nextNonEmpty]!.trim()) nextNonEmpty += 1;
+      if (
+        quoteLines.length === 1
+        && legacyFrameQuotePattern.test(quoteLines[0]!)
+        && nextNonEmpty < lines.length
+        && standaloneImagePattern.test(lines[nextNonEmpty]!)
+      ) {
+        continue;
+      }
+      const quote = document.createElement("blockquote");
+      for (const quoteLine of quoteLines) {
         const paragraph = document.createElement("p");
-        appendInline(paragraph, lines[index++]!.replace(/^\s*>\s?/, ""));
+        appendInline(paragraph, quoteLine.replace(/^\s*>\s?/, ""));
         quote.append(paragraph);
+      }
+      if (
+        [...root.children].every((el) => el.tagName === "H1")
+        && quoteLines.length === 1
+        && (/\[视频链接\]\(https?:\/\//i.test(quoteLines[0]!) || (/模型[:：]/.test(quoteLines[0]!) && /来源[:：]/.test(quoteLines[0]!)))
+      ) {
+        quote.className = "note-meta-quote";
       }
       root.append(quote);
       continue;
@@ -266,8 +413,45 @@ export function renderMarkdownPreview(markdown: string, sourceVideo: VideoTarget
         { depth: Math.floor(firstList[1]!.replace(/\t/g, "  ").length / 2), ordered: rootOrdered, listEl: rootList, lastLi: null }
       ];
       while (index < lines.length) {
-        const match = lines[index]!.match(listPattern);
-        if (!match) break;
+        const currentLine = lines[index]!;
+        if (!currentLine.trim()) {
+          let lookahead = index + 1;
+          while (lookahead < lines.length && !lines[lookahead]!.trim()) lookahead += 1;
+          if (lookahead < lines.length) {
+            const upcoming = lines[lookahead]!;
+            if (/^\s+(?:`{3,}|~{3,})/.test(upcoming) || (/^\s{2,}\S/.test(upcoming) && !startsBlock(upcoming))) {
+              index = lookahead;
+              continue;
+            }
+            const nextMatch = upcoming.match(listPattern);
+            if (nextMatch) {
+              const nextDepth = Math.floor(nextMatch[1]!.replace(/\t/g, "  ").length / 2);
+              const nextOrdered = /^\d/.test(nextMatch[2]!);
+              if (nextDepth > 0 || nextOrdered === rootOrdered) {
+                index = lookahead;
+                continue;
+              }
+            }
+          }
+          break;
+        }
+        if (/^\s+(?:`{3,}|~{3,})/.test(currentLine) && stack.at(-1)!.lastLi) {
+          const { pre, nextIndex } = consumeFencedCodeBlock(index);
+          stack.at(-1)!.lastLi!.append(pre);
+          index = nextIndex;
+          continue;
+        }
+        const match = currentLine.match(listPattern);
+        if (!match) {
+          if (/^\s{2,}\S/.test(currentLine) && !startsBlock(currentLine) && stack.at(-1)!.lastLi) {
+            const cont = document.createElement("p");
+            appendInline(cont, currentLine.trim());
+            stack.at(-1)!.lastLi!.append(cont);
+            index += 1;
+            continue;
+          }
+          break;
+        }
         const depth = Math.floor(match[1]!.replace(/\t/g, "  ").length / 2);
         const ordered = /^\d/.test(match[2]!);
         if (depth === stack[0]!.depth && ordered !== stack[0]!.ordered && stack.length === 1) break;

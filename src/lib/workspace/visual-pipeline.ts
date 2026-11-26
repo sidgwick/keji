@@ -1,6 +1,7 @@
 import { Keji, type KejiSettings, type KeyFrameItem, type ModelCapability, type VideoTarget } from '../keji.ts';
 import { getCachedVideo } from '../lesson-cache.ts';
 import { restoreScreenshotEmbeds } from '../markdown.ts';
+import { planVisualCandidateTimes, refineKeyframeTargetsWithTranscript } from '../note-schema.ts';
 import { workspace } from './state.svelte.ts';
 import { callBackground } from './ui.ts';
 import { captureVideoFrames, type FrameTarget } from './video-frames.ts';
@@ -16,12 +17,11 @@ export function renderVideoProgress(progress: any): void {
   const total = Number(progress.totalBytes) || 0;
   const loaded = Number(progress.loadedBytes) || 0;
   const mb = (value: number) => `${(value / 1024 / 1024).toFixed(1)} MB`;
-  const providerName = progress.provider === 'mimo' ? '小米 MiMo' : '模型';
   if (progress.stage === 'downloading') {
     const amount = total ? `${mb(loaded)} / ${mb(total)} · ${Math.min(100, Math.floor(loaded / total * 100))}%` : `${mb(loaded)} 已获取`;
-    workspace.generationStageText = `正在从 B 站下载并缓存视频流供 ${providerName} 分析：${amount}`;
+    workspace.generationStageText = `正在从 B 站下载并缓存视频流供模型分析：${amount}`;
   } else if (progress.stage === 'analyzing') {
-    workspace.generationStageText = `视频已提交（${mb(loaded)}），${providerName} 正在联合分析画面和讲解内容…`;
+    workspace.generationStageText = `视频已提交（${mb(loaded)}），模型正在联合分析画面和讲解内容…`;
   }
 }
 
@@ -38,50 +38,6 @@ export function framesFromMarkdown(markdown: string): KeyFrameItem[] {
     });
 }
 
-function sampleVideoCandidateTimes(duration: number, transcript: string, maxCount = 24): number[] {
-  const seconds = Number(duration);
-  if (!Number.isFinite(seconds) || seconds < 10) return [];
-  const limit = Math.max(1, Math.min(24, Math.floor(Number(maxCount) || 24)));
-  const count = Math.min(limit, Math.max(8, Math.ceil(seconds / 90)));
-  const end = Math.max(0, seconds - 1);
-  const speechTimes = [...String(transcript || '').matchAll(/\[(\d{1,2}:\d{2}(?::\d{2})?)\]/g)]
-    .map((match) => Keji.parseTime(match[1]!))
-    .filter((time): time is number => time !== null && time >= 0 && time <= end)
-    .sort((a, b) => a - b);
-  const speechQuota = speechTimes.length > 1 ? Math.floor(count / 2) : 0;
-  const uniformQuota = count - speechQuota;
-  const candidates: number[] = [];
-  const add = (value: number) => {
-    const time = Math.min(end, Math.max(0, Math.floor(value)));
-    if (candidates.every((candidate) => Math.abs(candidate - time) >= 5)) candidates.push(time);
-  };
-
-  for (let index = 0; index < uniformQuota; index += 1) {
-    add((index + 0.5) * seconds / uniformQuota);
-  }
-  for (let index = 0; index < speechQuota; index += 1) {
-    const quantile = Math.min(speechTimes.length - 1, Math.floor((index + 0.5) * speechTimes.length / speechQuota));
-    add(speechTimes[quantile]!);
-  }
-
-  while (candidates.length < count) {
-    const ordered = [0, ...candidates].sort((a, b) => a - b);
-    ordered.push(end);
-    let largestGap = 0;
-    let midpoint: number | null = null;
-    for (let index = 1; index < ordered.length; index += 1) {
-      const gap = ordered[index]! - ordered[index - 1]!;
-      if (gap > largestGap) {
-        largestGap = gap;
-        midpoint = (ordered[index]! + ordered[index - 1]!) / 2;
-      }
-    }
-    if (midpoint === null || largestGap < 10) break;
-    add(midpoint);
-  }
-  return candidates.sort((a, b) => a - b).slice(0, count);
-}
-
 function findKeyframes(markdown: string): FrameTarget[] {
   const pattern = /\[\[KEYFRAME:\s*(\d{1,2}:\d{2}(?::\d{2})?)\s*\|\s*([^\]]+)\]\]|>\s*关键时刻\s*·\s*(\d{1,2}:\d{2}(?::\d{2})?)\s*[：:]\s*([^\r\n（]+)(?:（截图未能捕获[^）]*）)?/gi;
   const found: FrameTarget[] = [];
@@ -90,7 +46,7 @@ function findKeyframes(markdown: string): FrameTarget[] {
     const caption = match[2] || match[4] || '';
     const seconds = Keji.parseTime(timestamp);
     if (seconds === null) continue;
-    if (found.some((frame) => Math.abs(frame.seconds - seconds) < 5)) continue;
+    if (found.some((frame) => Math.abs(frame.seconds - seconds) < 8)) continue;
     found.push({ raw: match[0], timestamp, seconds, caption: caption.trim() });
   }
   return found;
@@ -103,60 +59,72 @@ function humanizeKeyframeMarkers(markdown: string, reason = '截图未能捕获'
   );
 }
 
-async function captureKeyframes(
-  markdown: string,
-  tabId: number | null,
-  signal: AbortSignal | undefined,
-  videoTarget: VideoTarget
-) {
-  const keyframes = findKeyframes(markdown);
-  if (!keyframes.length) return { markdown, frames: [] as KeyFrameItem[], failed: false };
+async function resolvePreparedVideoSource(tabId: number | null, videoTarget: VideoTarget): Promise<Record<string, any>> {
   const cachedVideo = videoTarget ? await getCachedVideo(videoTarget, { expectedCid: videoTarget.cid }).catch(() => null) : null;
-  let videoSource: Record<string, any>;
   if (cachedVideo?.file) {
-    workspace.generationStageText = '正在从本机缓存视频轨截取关键画面…';
-    videoSource = {
+    workspace.generationStageText = '正在从本机缓存视频轨读取画面…';
+    return {
       file: cachedVideo.file,
       duration: Number(videoTarget?.duration || cachedVideo.meta?.duration) || 0,
       bvid: videoTarget?.bvid || Keji.bvidFromUrl(videoTarget?.url),
       page: Number(videoTarget?.page) || 1
     };
-  } else {
-    const source = await callBackground('READ_VIDEO_SOURCE', { tabId, lesson: videoTarget });
-    if (!source?.ok) throw new Error(source?.error || '无法读取 B 站视频轨。');
-    const origin = new URL(source.source.url).origin;
-    if (!await chrome.permissions.contains({ origins: [`${origin}/*`] })) {
-      throw new Error('尚未授权访问当前视频 CDN；请在设置中重新保存配置并允许 B 站视频域名。');
-    }
-    const prepared = await callBackground('PREPARE_VIDEO_CAPTURE');
-    if (!prepared?.ok) throw new Error(prepared?.error || '无法准备视频画面读取。');
-    workspace.generationStageText = '正在后台读取视频轨准备截图…';
-    videoSource = {
-      ...source.source,
-      bvid: videoTarget?.bvid || Keji.bvidFromUrl(videoTarget?.url),
-      page: Number(videoTarget?.page) || 1,
-      cid: Number(videoTarget?.cid) || 0,
-      title: videoTarget?.title || '',
-      part: videoTarget?.part || '',
-      pageUrl: videoTarget?.url || ''
-    };
   }
-  const captured = await captureVideoFrames(videoSource, keyframes, (loaded, total, index, count, timestamp) => {
-    if (index) {
-      workspace.generationStageText = `正在截取关键画面 ${index}/${count} · ${timestamp}`;
-    } else {
-      const amount = ((loaded || 0) / 1024 / 1024).toFixed(1);
-      const totalAmount = total ? ` / ${(total / 1024 / 1024).toFixed(1)} MB` : ' MB';
-      workspace.generationStageText = `正在后台下载并缓存视频轨 ${amount}${totalAmount}…`;
-    }
-  }, signal);
+  const source = await callBackground('READ_VIDEO_SOURCE', { tabId, lesson: videoTarget });
+  if (!source?.ok) throw new Error(source?.error || '无法读取 B 站视频轨。');
+  const origin = new URL(source.source.url).origin;
+  if (!await chrome.permissions.contains({ origins: [`${origin}/*`] })) {
+    throw new Error('尚未授权访问当前视频 CDN；请在设置中重新保存配置并允许 B 站视频域名。');
+  }
+  const prepared = await callBackground('PREPARE_VIDEO_CAPTURE');
+  if (!prepared?.ok) throw new Error(prepared?.error || '无法准备视频画面读取。');
+  workspace.generationStageText = '正在后台读取视频轨准备截图…';
+  return {
+    ...source.source,
+    bvid: videoTarget?.bvid || Keji.bvidFromUrl(videoTarget?.url),
+    page: Number(videoTarget?.page) || 1,
+    cid: Number(videoTarget?.cid) || 0,
+    title: videoTarget?.title || '',
+    part: videoTarget?.part || '',
+    pageUrl: videoTarget?.url || ''
+  };
+}
+
+function reportFrameCaptureProgress(loaded: number | null, total: number | null, index?: number, count?: number, timestamp?: string) {
+  if (index) {
+    workspace.generationStageText = `正在截取关键画面 ${index}/${count} · ${timestamp}`;
+  } else {
+    const amount = ((loaded || 0) / 1024 / 1024).toFixed(1);
+    const totalAmount = total ? ` / ${(total / 1024 / 1024).toFixed(1)} MB` : ' MB';
+    workspace.generationStageText = `正在后台下载并缓存视频轨 ${amount}${totalAmount}…`;
+  }
+}
+
+async function captureKeyframes(
+  markdown: string,
+  tabId: number | null,
+  signal: AbortSignal | undefined,
+  videoTarget: VideoTarget,
+  transcript = ''
+) {
+  const rawKeyframes = findKeyframes(markdown);
+  if (!rawKeyframes.length) return { markdown, frames: [] as KeyFrameItem[], failed: false };
+  const videoSource = await resolvePreparedVideoSource(tabId, videoTarget);
+  const duration = Number(videoSource.duration || videoTarget?.duration) || 0;
+  const keyframes = transcript
+    ? refineKeyframeTargetsWithTranscript(rawKeyframes, transcript, duration)
+    : rawKeyframes;
+
+  const captured = await captureVideoFrames(videoSource, keyframes, reportFrameCaptureProgress, signal, {
+    settleWindowSeconds: 3.5
+  });
 
   let output = markdown;
   for (const frame of keyframes) {
     const found = captured.find((item) => item.raw === frame.raw);
     if (found) {
       const alt = `${found.caption} · ${found.timestamp}`.replace(/[\[\]]/g, '');
-      output = output.replace(frame.raw!, `> **画面要点 · ${found.timestamp}**：${found.caption}\n\n![${alt}](${found.dataUrl})`);
+      output = output.replace(frame.raw!, `![${alt}](${found.dataUrl})`);
     } else {
       output = output.replace(frame.raw!, `> 关键时刻 · ${frame.timestamp}：${frame.caption}（截图未能捕获）`);
     }
@@ -184,41 +152,87 @@ async function discoverAndCaptureKeyframes(
   const durationValue = Number(duration);
   const totalSeconds = (Number.isFinite(durationValue) && durationValue > 0 ? durationValue : 0) || transcriptEnd;
   if (totalSeconds < 10) throw new Error('视频时长不可用，无法抽取候选画面供视觉模型筛选。');
-  const candidates = sampleVideoCandidateTimes(totalSeconds, transcript);
+
+  const candidates = planVisualCandidateTimes(totalSeconds, transcript, markdown);
   if (!candidates.length) throw new Error('视频时间线不可用，无法抽取候选画面供视觉模型筛选。');
-  const frames: FrameTarget[] = candidates.map((seconds) => ({ timestamp: Keji.formatTime(seconds), seconds, caption: '候选画面' }));
-  const candidateMarkdown = frames.map((frame) => `[[KEYFRAME: ${frame.timestamp} | 候选画面]]`).join('\n\n');
-  const captured = await captureKeyframes(candidateMarkdown, options.tabId, options.signal, options.videoTarget);
-  if (!captured.frames.length) throw new Error('无法捕获候选画面。');
-  workspace.generationStageText = '正在由视觉模型结合文字稿筛选重点画面…';
+
+  const videoSource = await resolvePreparedVideoSource(options.tabId, options.videoTarget);
+  const candidateTargets: FrameTarget[] = candidates.map((seconds) => ({
+    timestamp: Keji.formatTime(seconds),
+    seconds,
+    caption: '候选画面'
+  }));
+  const capturedCandidates = await captureVideoFrames(videoSource, candidateTargets, (loaded, total, index, count, ts) => {
+    if (index) workspace.generationStageText = `正在采样重点候选画面 ${index}/${count} · ${ts}`;
+    else reportFrameCaptureProgress(loaded, total);
+  }, options.signal, { settleWindowSeconds: 0 });
+  if (!capturedCandidates.length) throw new Error('无法捕获候选画面。');
+
+  workspace.generationStageText = '正在由视觉模型结合文字稿筛选重点画面并校对板书…';
   const response = await callBackground('ENRICH_NOTE_WITH_FRAMES', {
     payload: {
       title,
       transcript,
       markdown,
-      frames: captured.frames,
+      frames: capturedCandidates,
       discoverKeyframes: true,
       generationTaskId: options.generationTaskId
     }
   });
   if (response?.cancelled || options.isCancelled()) throw Object.assign(new Error('已停止生成。'), { cancelled: true });
   if (!response?.ok) throw new Error(response?.error || '视觉模型未能筛选候选画面。');
+
   const selectedMarkers = findKeyframes(response.markdown);
-  const selected = selectedMarkers
-    .map((marker) => {
-      const frame = captured.frames.find((candidate) => Math.abs(candidate.seconds - marker.seconds) <= 1);
-      return frame ? { ...frame, caption: marker.caption, marker: marker.raw! } : null;
-    })
-    .filter((item): item is KeyFrameItem & { marker: string } => Boolean(item))
-    .slice(0, 8);
-  if (!selected.length) throw new Error('视觉模型没有返回候选画面的有效时间戳；改用文字稿中的重点时刻。');
-  let output: string = response.markdown;
-  for (const frame of selected) {
-    const alt = `${frame.caption} · ${frame.timestamp}`.replace(/[\[\]]/g, '');
-    output = output.replace(frame.marker, `> **画面要点 · ${frame.timestamp}**：${frame.caption}\n\n![${alt}](${frame.dataUrl})`);
+  if (!selectedMarkers.length) {
+    // Content-driven 0 keyframes: no diagram/board focal points need embedding.
+    return {
+      markdown: String(response.markdown || '').replace(/\[\[KEYFRAME:[^\]]+\]\]/gi, '').replace(/\n{3,}/g, '\n\n').trim(),
+      frames: [] as KeyFrameItem[],
+      failed: false
+    };
   }
-  output = output.replace(/\[\[KEYFRAME:[^\]]+\]\]/gi, '');
-  return { markdown: output, frames: selected, failed: captured.failed };
+
+  const matchedFrames: Array<KeyFrameItem & { marker: string }> = [];
+  const unmatchedTargets: FrameTarget[] = [];
+  for (const marker of selectedMarkers) {
+    let nearest: KeyFrameItem | null = null;
+    let bestDiff = 4.5;
+    for (const candidate of capturedCandidates) {
+      const diff = Math.abs(candidate.seconds - marker.seconds);
+      if (diff <= bestDiff) {
+        bestDiff = diff;
+        nearest = candidate;
+      }
+    }
+    if (nearest) {
+      matchedFrames.push({ ...nearest, caption: marker.caption, marker: marker.raw! });
+    } else {
+      unmatchedTargets.push(marker);
+    }
+  }
+
+  let extraCaptured: KeyFrameItem[] = [];
+  if (unmatchedTargets.length) {
+    extraCaptured = await captureVideoFrames(videoSource, unmatchedTargets, reportFrameCaptureProgress, options.signal, {
+      settleWindowSeconds: 2.5
+    }).catch(() => []);
+  }
+
+  const allSelected: KeyFrameItem[] = [
+    ...matchedFrames,
+    ...extraCaptured.map((item) => ({ ...item, marker: item.raw }))
+  ].sort((a, b) => a.seconds - b.seconds);
+
+  let output: string = response.markdown;
+  const embeddedFrames: KeyFrameItem[] = [];
+  for (const frame of allSelected) {
+    if (!frame.marker || !output.includes(frame.marker)) continue;
+    const alt = `${frame.caption} · ${frame.timestamp}`.replace(/[\[\]]/g, '');
+    output = output.replace(frame.marker, `![${alt}](${frame.dataUrl})`);
+    embeddedFrames.push(frame);
+  }
+  output = output.replace(/\[\[KEYFRAME:[^\]]+\]\]/gi, '').replace(/\n{3,}/g, '\n\n').trim();
+  return { markdown: output, frames: embeddedFrames, failed: unmatchedTargets.length > extraCaptured.length };
 }
 
 async function enrichVideoWithProgress(payload: Record<string, unknown>, generationTaskId: string) {
@@ -272,7 +286,7 @@ export async function runVisualAnalysisPipeline({
   if (!Keji.supportsImage(capability)) {
     if (findKeyframes(bodyMarkdown).length && (sameOpenVideo || cachedVideo?.file)) {
       try {
-        const captured = await captureKeyframes(bodyMarkdown, tabId, signal, video);
+        const captured = await captureKeyframes(bodyMarkdown, tabId, signal, video, transcript);
         bodyMarkdown = captured.markdown;
         frames = captured.frames;
         captureFailed = captured.failed;
@@ -297,7 +311,7 @@ export async function runVisualAnalysisPipeline({
     try {
       workspace.generationStageText = canReuseCompactCache
         ? '正在读取本机缓存视频并提交给模型联合分析…'
-        : '正在获取当前分 P 紧凑视频流并提交给模型联合分析…';
+        : '正在获取本节视频流并提交给模型联合分析…';
       let source: any = null;
       if (!canReuseCompactCache) {
         source = await callBackground('READ_VIDEO_SOURCE', { tabId, maxTargetBytes: MAX_INLINE_VIDEO_BYTES, lesson: video });
@@ -332,7 +346,7 @@ export async function runVisualAnalysisPipeline({
 
   if (!visualAnalysis) {
     try {
-      workspace.generationStageText = '正在采集候选画面，由视觉模型结合内容筛选重点帧…';
+      workspace.generationStageText = '正在采集重点候选画面，由视觉模型结合内容筛选…';
       const discovered = await discoverAndCaptureKeyframes(
         bodyMarkdown,
         transcript,
@@ -357,7 +371,7 @@ export async function runVisualAnalysisPipeline({
 
   if (!visualAnalysis || visualAnalysisMode === 'full-video') {
     try {
-      const captured = await captureKeyframes(bodyMarkdown, tabId, signal, video);
+      const captured = await captureKeyframes(bodyMarkdown, tabId, signal, video, transcript);
       bodyMarkdown = captured.markdown;
       frames = captured.frames;
       captureFailed = captured.failed;

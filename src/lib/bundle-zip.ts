@@ -1,3 +1,5 @@
+import { NOTE_DOCUMENT_STRUCTURES, type NoteViewKey } from "./note-structures.ts";
+
 export function safeFilename(value?: string, fallback = "课程笔记"): string {
   return String(value || fallback)
     .replace(/[\\/:*?"<>|\u0000-\u001f]/g, "-")
@@ -98,20 +100,68 @@ function createStoredZip(files: ZipFileEntry[]): Uint8Array {
   return zip;
 }
 
-export function createNoteBundleZip(note: { title?: string; markdown: string }): {
+export function createNoteBundleZip(note: {
+  title?: string;
+  markdown: string;
+  views?: Partial<Record<NoteViewKey, string>>;
+  flashcardMarkdown?: string;
+  quizMarkdown?: string;
+  personalNote?: string;
+}): {
   filename: string;
   zip: Uint8Array;
   imageCount: number;
 } {
   const folder = safeFilename(note.title || "课程笔记");
-  const prepared = rewriteEmbeddedImages(note.markdown || "");
-  const files: ZipFileEntry[] = [
-    { path: `${folder}/笔记.md`, data: prepared.markdown },
-    ...prepared.files.map((file) => ({ ...file, path: `${folder}/${file.path}` }))
-  ];
+  const docEntries: Array<{ prefix: string; filename: string; markdown: string }> = [];
+  for (const item of NOTE_DOCUMENT_STRUCTURES) {
+    const content = String(note.views?.[item.id] || "").trim();
+    if (content) docEntries.push({ prefix: item.id, filename: `${item.label}.md`, markdown: content });
+  }
+  const hasViewEntries = docEntries.length > 0;
+  const flashcardMd = String(note.flashcardMarkdown || "").trim();
+  if (flashcardMd) docEntries.push({ prefix: "flashcards", filename: "记忆闪卡.md", markdown: flashcardMd });
+  const quizMd = String(note.quizMarkdown || "").trim();
+  if (quizMd) docEntries.push({ prefix: "quiz", filename: "随堂自测.md", markdown: quizMd });
+  const rawPersonal = String(note.personalNote || "").trim();
+  const personalMd = rawPersonal ? `# 我的批注\n\n${rawPersonal}\n` : "";
+
+  if (!docEntries.length) {
+    const prepared = rewriteEmbeddedImages(note.markdown || "");
+    const files: ZipFileEntry[] = [
+      { path: `${folder}/笔记.md`, data: prepared.markdown },
+      ...prepared.files.map((file) => ({ ...file, path: `${folder}/${file.path}` }))
+    ];
+    if (personalMd) files.push({ path: `${folder}/我的批注.md`, data: personalMd });
+    return {
+      filename: `${folder}-笔记资源包.zip`,
+      zip: createStoredZip(files),
+      imageCount: prepared.files.length
+    };
+  }
+
+  const fallbackMd = String(note.markdown || "").trim();
+  if (!hasViewEntries && fallbackMd && fallbackMd !== flashcardMd && fallbackMd !== quizMd) {
+    docEntries.unshift({ prefix: "note", filename: "笔记.md", markdown: fallbackMd });
+  }
+  if (personalMd) {
+    docEntries.push({ prefix: "personal", filename: "我的批注.md", markdown: personalMd });
+  }
+
+  const files: ZipFileEntry[] = [];
+  let imageCount = 0;
+  const usePrefix = docEntries.length > 1 || hasViewEntries || Boolean(flashcardMd) || Boolean(quizMd);
+  for (const entry of docEntries) {
+    const prepared = rewriteEmbeddedImages(entry.markdown, usePrefix ? entry.prefix : "");
+    files.push({ path: `${folder}/${entry.filename}`, data: prepared.markdown });
+    for (const asset of prepared.files) {
+      files.push({ ...asset, path: `${folder}/${asset.path}` });
+    }
+    imageCount += prepared.files.length;
+  }
   return {
     filename: `${folder}-笔记资源包.zip`,
     zip: createStoredZip(files),
-    imageCount: prepared.files.length
+    imageCount
   };
 }

@@ -103,24 +103,6 @@ export function normalizeTranscriptFile(
   return { format: extension === "vtt" || /^\s*WEBVTT\b/m.test(text) ? "vtt" : "srt", transcript, cueCount: cues.length };
 }
 
-export function summarizeTranscriptionLanguageRanges(segments?: TranscriptSegment[]): string[] {
-  const ranges: Array<{ language: string; start: number; end: number }> = [];
-  for (const segment of [...(Array.isArray(segments) ? segments : [])].sort((a, b) => a.time - b.time)) {
-    const language = String(segment.language || "").trim();
-    if (!language) continue;
-    const time = Math.max(0, Number(segment.time) || 0);
-    const end = Math.max(time, Number(segment.end) || time);
-    const current = ranges.at(-1);
-    if (current?.language === language) current.end = Math.max(current.end, end);
-    else ranges.push({ language, start: time, end });
-  }
-  const summary = ranges.slice(0, 4).map((range) =>
-    `${range.language} ${Keji.formatTime(range.start)}–${Keji.formatTime(range.end)}`
-  );
-  if (ranges.length > 4) summary.push(`另有 ${ranges.length - 4} 段语言区间`);
-  return summary;
-}
-
 export function resolveSelectedTranscriptTimeRange(
   transcript: string,
   selectionStart: number,

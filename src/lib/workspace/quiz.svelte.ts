@@ -22,19 +22,16 @@ interface ActiveQuizContext {
 }
 
 export const quizState = $state({
-  visible: false,
   generating: false,
   saving: false,
-  showButton: false,
-  buttonLabel: '随堂自测',
   hasQuestions: false,
-  isTemplateQuiz: false,
+  canGenerate: false,
   wrongOnly: false,
   progressLabel: '',
+  tabBadge: '',
   hasWrong: false,
   questions: [] as QuizQuestion[],
   answers: {} as Record<string, string>,
-  focusTrigger: 0,
 });
 
 const activeContext: ActiveQuizContext = {
@@ -51,21 +48,31 @@ const activeContext: ActiveQuizContext = {
 let allQuestions: QuizQuestion[] = [];
 let activeRecord: QuizRecordState | undefined;
 let wrongFilterIds: Set<string> | null = null;
+let generatingQuizNoteId: string | null = null;
+
+function quizContextKey(noteId: string | null): string {
+  return noteId ?? '__unsaved__';
+}
 
 function refreshQuizViewState(): void {
-  if (activeContext.editing || !activeContext.markdown) {
-    quizState.showButton = false;
-    quizState.visible = false;
+  if (activeContext.editing) {
+    quizState.generating = false;
+    quizState.hasQuestions = false;
+    quizState.canGenerate = false;
+    quizState.questions = [];
+    quizState.tabBadge = '';
     return;
   }
+  quizState.generating = Boolean(
+    generatingQuizNoteId && generatingQuizNoteId === quizContextKey(activeContext.noteId)
+  );
   const isTemplateQuiz = Boolean(getNoteStructure(activeContext.template).supportsQuiz);
-  const quizMarkdown = isTemplateQuiz ? activeContext.markdown : (activeRecord?.generatedMarkdown || '');
+  const quizMarkdown = activeRecord?.generatedMarkdown || (isTemplateQuiz ? activeContext.markdown : '');
   allQuestions = quizMarkdown ? parseQuizQuestions(quizMarkdown) : [];
   const answers = { ...(activeRecord?.answers || {}) };
   const score = scoreQuizQuestions(allQuestions, answers);
 
-  quizState.showButton = true;
-  quizState.isTemplateQuiz = isTemplateQuiz;
+  quizState.canGenerate = Boolean(activeContext.markdown.trim() || activeContext.transcript.trim());
   quizState.hasQuestions = allQuestions.length > 0;
   quizState.answers = answers;
   quizState.wrongOnly = Boolean(wrongFilterIds);
@@ -73,9 +80,9 @@ function refreshQuizViewState(): void {
     ? allQuestions.filter((q) => wrongFilterIds!.has(q.id))
     : allQuestions;
   quizState.hasWrong = score.wrongIds.length > 0;
-  quizState.buttonLabel = allQuestions.length
-    ? (score.answered ? `随堂自测 · ${score.correct}/${score.total}` : `随堂自测 · ${score.total} 题`)
-    : '生成随堂自测';
+  quizState.tabBadge = allQuestions.length
+    ? (score.answered ? `${score.correct}/${score.total}` : `${score.total} 题`)
+    : '';
   quizState.progressLabel = allQuestions.length
     ? (score.answered
       ? `已作答 ${score.answered}/${score.total} 题 · 正确 ${score.correct} 题${score.wrongIds.length ? ` · 错题 ${score.wrongIds.length} 题` : ''}`
@@ -83,19 +90,28 @@ function refreshQuizViewState(): void {
     : '围绕本节重点生成 5 到 8 道理解检测题';
 }
 
-async function persistActiveQuizRecord(): Promise<void> {
-  if (!activeContext.noteId || !activeRecord) return;
+async function persistQuizRecordForNote(
+  noteId: string | null,
+  record: QuizRecordState
+): Promise<QuizRecordState | undefined> {
+  if (!noteId) return undefined;
   quizState.saving = true;
   try {
     const result = await callBackground('UPDATE_NOTE_QUIZ', {
-      id: activeContext.noteId,
-      quizState: activeRecord
+      id: noteId,
+      quizState: record
     });
     if (!result?.ok) throw new Error(result?.error || '无法保存自测进度。');
-    if (result.quizState) activeRecord = result.quizState;
+    return result.quizState;
   } finally {
     quizState.saving = false;
   }
+}
+
+export function getActiveQuizCopyMarkdown(): string {
+  if (!allQuestions.length) return '';
+  const isTemplateQuiz = Boolean(getNoteStructure(activeContext.template).supportsQuiz);
+  return activeRecord?.generatedMarkdown || (isTemplateQuiz ? activeContext.markdown : '');
 }
 
 export function setActiveNoteQuizRecord(record?: QuizRecordState): void {
@@ -125,11 +141,6 @@ export function pruneActiveNoteQuizOnRegenerate(markdown: string, template: stri
   refreshQuizViewState();
 }
 
-export function closeQuizPanelQuietly(): void {
-  quizState.visible = false;
-  wrongFilterIds = null;
-}
-
 export function syncActiveNoteQuiz(context: ActiveQuizContext): void {
   activeContext.noteId = context.noteId;
   activeContext.title = context.title;
@@ -139,29 +150,17 @@ export function syncActiveNoteQuiz(context: ActiveQuizContext): void {
   activeContext.template = context.template;
   activeContext.videoUrl = context.videoUrl;
   activeContext.editing = context.editing;
-  if (context.editing) closeQuizPanelQuietly();
+  if (context.editing) wrongFilterIds = null;
   refreshQuizViewState();
 }
 
-export function toggleOrOpenQuiz(): void {
-  if (quizState.visible) {
-    closeQuizPanel();
-    return;
-  }
-  if (allQuestions.length) {
-    wrongFilterIds = null;
-    refreshQuizViewState();
-    quizState.visible = true;
-    quizState.focusTrigger += 1;
-    return;
-  }
-  void generateQuizForActiveNote();
-}
-
 export async function generateQuizForActiveNote(): Promise<void> {
-  if (!activeContext.markdown || quizState.generating) return;
-  quizState.generating = true;
-  showNotice('正在结合本节笔记生成随堂自测题…', 'info');
+  if ((!activeContext.markdown.trim() && !activeContext.transcript.trim()) || generatingQuizNoteId) return;
+  const targetNoteId = activeContext.noteId;
+  const targetKey = quizContextKey(targetNoteId);
+  generatingQuizNoteId = targetKey;
+  refreshQuizViewState();
+  showNotice('正在生成本节随堂自测题…', 'info');
   try {
     const result = await callBackground('GENERATE_NOTE_QUIZ', {
       payload: {
@@ -172,40 +171,49 @@ export async function generateQuizForActiveNote(): Promise<void> {
       }
     });
     if (!result?.ok) throw new Error(result?.error || '生成随堂自测失败。');
-    activeRecord = {
+    const nextRecord: QuizRecordState = {
       generatedMarkdown: result.result.markdown,
       answers: {},
       updatedAt: new Date().toISOString()
     };
-    wrongFilterIds = null;
-    if (activeContext.noteId) await persistActiveQuizRecord();
-    refreshQuizViewState();
-    quizState.visible = true;
-    quizState.focusTrigger += 1;
-    showNotice(`已生成 ${result.result.count} 道随堂自测题。`, 'success');
+    const saved = targetNoteId ? await persistQuizRecordForNote(targetNoteId, nextRecord) : undefined;
+    if (activeContext.noteId === targetNoteId) {
+      activeRecord = saved || nextRecord;
+      wrongFilterIds = null;
+      refreshQuizViewState();
+      showNotice(`已生成 ${result.result.count} 道随堂自测题。`, 'success');
+    } else {
+      showNotice(`原笔记的 ${result.result.count} 道随堂自测已在后台保存。`, 'success');
+    }
   } catch (error) {
     showNotice((error as Error).message || '生成随堂自测失败。', 'error');
   } finally {
-    quizState.generating = false;
+    if (generatingQuizNoteId === targetKey) generatingQuizNoteId = null;
+    refreshQuizViewState();
   }
 }
 
 export async function selectQuizOption(questionId: string, optionKey: string): Promise<void> {
   if (!questionId || !optionKey || quizState.saving || quizState.answers[questionId]) return;
+  const targetNoteId = activeContext.noteId;
   const previousRecord = getActiveNoteQuizRecord();
   const nextAnswers = { ...(activeRecord?.answers || {}), [questionId]: optionKey.toUpperCase() };
-  activeRecord = {
+  const nextRecord: QuizRecordState = {
     ...(activeRecord?.generatedMarkdown ? { generatedMarkdown: activeRecord.generatedMarkdown } : {}),
     answers: nextAnswers,
     updatedAt: new Date().toISOString()
   };
+  activeRecord = nextRecord;
   refreshQuizViewState();
-  if (!activeContext.noteId) return;
+  if (!targetNoteId) return;
   try {
-    await persistActiveQuizRecord();
+    const saved = await persistQuizRecordForNote(targetNoteId, nextRecord);
+    if (saved && activeContext.noteId === targetNoteId) activeRecord = saved;
   } catch (error) {
-    activeRecord = previousRecord;
-    refreshQuizViewState();
+    if (activeContext.noteId === targetNoteId) {
+      activeRecord = previousRecord;
+      refreshQuizViewState();
+    }
     showNotice((error as Error).message || '保存自测作答失败。', 'error');
   }
 }
@@ -213,50 +221,55 @@ export async function selectQuizOption(questionId: string, optionKey: string): P
 export async function retryWrongQuizQuestions(): Promise<void> {
   const score = scoreQuizQuestions(allQuestions, activeRecord?.answers || {});
   if (!score.wrongIds.length || quizState.saving) return;
+  const targetNoteId = activeContext.noteId;
   const previousRecord = getActiveNoteQuizRecord();
   const nextAnswers = { ...(activeRecord?.answers || {}) };
   for (const id of score.wrongIds) delete nextAnswers[id];
   wrongFilterIds = new Set(score.wrongIds);
-  activeRecord = {
+  const nextRecord: QuizRecordState = {
     ...(activeRecord?.generatedMarkdown ? { generatedMarkdown: activeRecord.generatedMarkdown } : {}),
     answers: nextAnswers,
     updatedAt: new Date().toISOString()
   };
+  activeRecord = nextRecord;
   refreshQuizViewState();
-  quizState.focusTrigger += 1;
-  if (!activeContext.noteId) return;
+  if (!targetNoteId) return;
   try {
-    await persistActiveQuizRecord();
+    const saved = await persistQuizRecordForNote(targetNoteId, nextRecord);
+    if (saved && activeContext.noteId === targetNoteId) activeRecord = saved;
   } catch (error) {
-    activeRecord = previousRecord;
-    wrongFilterIds = null;
-    refreshQuizViewState();
+    if (activeContext.noteId === targetNoteId) {
+      activeRecord = previousRecord;
+      wrongFilterIds = null;
+      refreshQuizViewState();
+    }
     showNotice((error as Error).message || '重置错题失败。', 'error');
   }
 }
 
 export async function resetAllQuizAnswers(): Promise<void> {
   if (quizState.saving) return;
+  const targetNoteId = activeContext.noteId;
   const previousRecord = getActiveNoteQuizRecord();
   wrongFilterIds = null;
-  activeRecord = {
+  const nextRecord: QuizRecordState = {
     ...(activeRecord?.generatedMarkdown ? { generatedMarkdown: activeRecord.generatedMarkdown } : {}),
     answers: {},
     updatedAt: new Date().toISOString()
   };
+  activeRecord = nextRecord;
   refreshQuizViewState();
-  if (!activeContext.noteId) return;
+  if (!targetNoteId) return;
   try {
-    await persistActiveQuizRecord();
+    const saved = await persistQuizRecordForNote(targetNoteId, nextRecord);
+    if (saved && activeContext.noteId === targetNoteId) activeRecord = saved;
   } catch (error) {
-    activeRecord = previousRecord;
-    refreshQuizViewState();
+    if (activeContext.noteId === targetNoteId) {
+      activeRecord = previousRecord;
+      refreshQuizViewState();
+    }
     showNotice((error as Error).message || '清空自测记录失败。', 'error');
   }
-}
-
-export function closeQuizPanel(): void {
-  closeQuizPanelQuietly();
 }
 
 export function videoLinkForQuizTimestamp(timestamp: string): string {

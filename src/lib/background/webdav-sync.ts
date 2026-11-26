@@ -1,5 +1,7 @@
 import { Keji, type KejiSettings } from "../keji.ts";
 import { deletedNoteTombstones, getAllNotes, importNotes } from "./notes-db.ts";
+import { getStored } from "../storage.ts";
+import { getCachedTranscription, listManualTranscriptions, putCachedTranscription } from "../lesson-cache.ts";
 
 export const REMOTE_NOTES_SYNC_ALARM = "keji-remote-notes-auto-sync";
 const MAX_BACKUP_BYTES = 200 * 1024 * 1024;
@@ -16,6 +18,15 @@ function createSerialQueue() {
 
 const queueRemoteBackup = createSerialQueue();
 const queueRemoteSyncSchedule = createSerialQueue();
+
+async function syncStorage() {
+  const values = await chrome.storage.local.get(["settings", "remoteBackupMutationVersion", "remoteBackupSyncState"]);
+  return {
+    settings: (values.settings || {}) as Partial<KejiSettings>,
+    remoteBackupMutationVersion: Number(values.remoteBackupMutationVersion) || 0,
+    remoteBackupSyncState: (values.remoteBackupSyncState || { status: "idle" }) as { status: string; lastSyncedAt?: number; noteCount?: number }
+  };
+}
 
 async function sha256Hex(value: BufferSource): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", value);
@@ -48,12 +59,40 @@ async function readBoundedResponseBytes(response: Response, maxBytes: number): P
 function parseBackupBytes(bytes: ArrayBuffer, invalidJsonMsg: string, invalidFormatMsg: string) {
   let text: string;
   try { text = new TextDecoder("utf-8", { fatal: true }).decode(bytes); } catch { throw new Error(invalidJsonMsg); }
-  let backup: { format?: unknown; notes?: unknown; deletedNotes?: unknown };
+  let backup: { format?: unknown; notes?: unknown; deletedNotes?: unknown; manualTranscripts?: unknown };
   try { backup = JSON.parse(text); } catch { throw new Error(invalidJsonMsg); }
   if (backup?.format !== "keji-notes-backup-v1" || !Array.isArray(backup.notes)) {
     throw new Error(invalidFormatMsg);
   }
-  return backup as { format: string; notes: any[]; deletedNotes?: any[] };
+  return backup as { format: string; notes: any[]; deletedNotes?: any[]; manualTranscripts?: any[] };
+}
+
+export async function createLocalNotesBackup(): Promise<string> {
+  const notes = await getAllNotes();
+  const body = JSON.stringify({
+    format: "keji-notes-backup-v1", exportedAt: new Date().toISOString(),
+    noteCount: notes.length, deletedNotes: await deletedNoteTombstones(),
+    manualTranscripts: await listManualTranscriptions(), notes
+  });
+  if (utf8Encoder.encode(body).byteLength > MAX_BACKUP_BYTES) throw new Error("笔记备份超过 200 MiB，无法导出。");
+  return body;
+}
+
+export async function importLocalNotesBackup(bytes: ArrayBuffer) {
+  if (bytes.byteLength > MAX_BACKUP_BYTES) throw new Error("笔记备份超过 200 MiB，无法导入。");
+  const backup = parseBackupBytes(bytes, "备份不是有效的 UTF-8 JSON 文件。", "文件不是课记笔记库备份。");
+  return importBackup(backup);
+}
+
+async function importBackup(backup: { notes: any[]; deletedNotes?: any[]; manualTranscripts?: any[] }) {
+  const result = await importNotes(backup.notes, backup.deletedNotes);
+  for (const record of Array.isArray(backup.manualTranscripts) ? backup.manualTranscripts : []) {
+    if (typeof record.lessonKey !== 'string' || typeof record.text !== 'string') continue;
+    const local = await getCachedTranscription(record.lessonKey);
+    if (local && Number(local.updatedAt) >= Number(record.updatedAt)) continue;
+    await putCachedTranscription(record.lessonKey, { ...record, manual: true });
+  }
+  return result;
 }
 
 function remoteNotesBackup(action: "upload" | "download" | "sync"): Promise<any> {
@@ -73,7 +112,7 @@ async function syncRemoteNotesBackup() {
 
 async function remoteNotesBackupTask(action: "upload" | "download"): Promise<any> {
   if (action !== "upload" && action !== "download") throw new Error("远程备份操作无效。");
-  const { settings: stored = {} } = await chrome.storage.local.get("settings");
+  const stored = await getStored<Partial<KejiSettings>>("settings", {});
   const settings: KejiSettings = { ...Keji.defaultSettings, ...stored };
   let url: URL;
   try { url = new URL(String(settings.remoteBackupUrl || "").trim()); } catch { throw new Error("请先在设置中填写远程备份文件 URL。"); }
@@ -100,19 +139,13 @@ async function remoteNotesBackupTask(action: "upload" | "download"): Promise<any
   const timeout = setTimeout(() => controller.abort(), 60000);
   try {
     if (action === "upload") {
-      const notes = await getAllNotes();
-      const body = JSON.stringify({
-        format: "keji-notes-backup-v1",
-        exportedAt: new Date().toISOString(),
-        noteCount: notes.length,
-        deletedNotes: await deletedNoteTombstones(),
-        notes
-      });
+      const body = await createLocalNotesBackup();
+      const noteCount = JSON.parse(body).noteCount as number;
       const bodyBytes = utf8Encoder.encode(body);
       if (bodyBytes.byteLength > MAX_BACKUP_BYTES) {
         throw new Error("远程笔记备份超过 200 MiB，未上传。请先移除较大的截图或拆分备份。");
       }
-      const { [revisionKey]: knownRevision } = await chrome.storage.local.get(revisionKey);
+      const knownRevision = await getStored<{ digest?: string } | null>(revisionKey, null);
       const current = await fetch(url, { headers, signal: controller.signal });
       let remoteExists = false;
       let writeCondition: Record<string, string> = {};
@@ -163,7 +196,7 @@ async function remoteNotesBackupTask(action: "upload" | "download"): Promise<any
       await chrome.storage.local.set({
         [revisionKey]: { digest: await sha256Hex(bodyBytes), etag: response.headers.get("etag") || "", updatedAt: Date.now() }
       });
-      return { action, noteCount: notes.length };
+      return { action, noteCount };
     }
 
     const response = await fetch(url, { headers, signal: controller.signal });
@@ -173,7 +206,7 @@ async function remoteNotesBackupTask(action: "upload" | "download"): Promise<any
     }
     const bytes = await readBoundedResponseBytes(response, MAX_BACKUP_BYTES);
     const backup = parseBackupBytes(bytes, "远程笔记备份不是有效的 UTF-8 JSON 文件。", "远程文件不是课记笔记库备份。");
-    const imported = await importNotes(backup.notes, backup.deletedNotes);
+    const imported = await importBackup(backup);
     await chrome.storage.local.set({
       [revisionKey]: {
         digest: await sha256Hex(bytes),
@@ -194,7 +227,7 @@ async function remoteNotesBackupTask(action: "upload" | "download"): Promise<any
 export function queueRemoteNotesAutoSync() {
   return queueRemoteSyncSchedule(async () => {
     try {
-      const { settings = {}, remoteBackupMutationVersion = 0 } = await chrome.storage.local.get(["settings", "remoteBackupMutationVersion"]);
+      const { settings, remoteBackupMutationVersion } = await syncStorage();
       if (!settings.remoteBackupAutoSync || !String(settings.remoteBackupUrl || "").trim()) return;
       const version = Math.max(Number(remoteBackupMutationVersion) || 0, Date.now()) + 1;
       await chrome.storage.local.set({
@@ -216,7 +249,7 @@ export async function disableRemoteNotesAutoSync(): Promise<void> {
 }
 
 export async function restoreAutoRemoteNotesSync(): Promise<void> {
-  const { settings = {}, remoteBackupSyncState = {} } = await chrome.storage.local.get(["settings", "remoteBackupSyncState"]);
+  const { settings, remoteBackupSyncState } = await syncStorage();
   if (!settings.remoteBackupAutoSync || !String(settings.remoteBackupUrl || "").trim()) return;
   if (["pending", "syncing"].includes(remoteBackupSyncState.status)) {
     await chrome.alarms.create(REMOTE_NOTES_SYNC_ALARM, { delayInMinutes: 1 });
@@ -224,13 +257,13 @@ export async function restoreAutoRemoteNotesSync(): Promise<void> {
 }
 
 export async function runAutoRemoteNotesSync(): Promise<void> {
-  const { settings = {}, remoteBackupMutationVersion = 0 } = await chrome.storage.local.get(["settings", "remoteBackupMutationVersion"]);
+  const { settings, remoteBackupMutationVersion } = await syncStorage();
   if (!settings.remoteBackupAutoSync || !String(settings.remoteBackupUrl || "").trim()) return;
   const startingVersion = Number(remoteBackupMutationVersion) || 0;
   await chrome.storage.local.set({ remoteBackupSyncState: { status: "syncing", startedAt: Date.now() } });
   try {
     const result = await remoteNotesBackup("sync");
-    const latest = await chrome.storage.local.get(["settings", "remoteBackupMutationVersion"]);
+    const latest = await syncStorage();
     if (!latest.settings?.remoteBackupAutoSync) {
       await chrome.storage.local.set({ remoteBackupSyncState: { status: "disabled", updatedAt: Date.now() } });
       return;
@@ -244,7 +277,7 @@ export async function runAutoRemoteNotesSync(): Promise<void> {
       remoteBackupSyncState: { status: "synced", lastSyncedAt: Date.now(), noteCount: result.noteCount || 0 }
     });
   } catch (error) {
-    const latest = await chrome.storage.local.get("settings");
+    const latest = await syncStorage();
     await chrome.storage.local.set({
       remoteBackupSyncState: !latest.settings?.remoteBackupAutoSync
         ? { status: "disabled", updatedAt: Date.now() }
@@ -254,10 +287,10 @@ export async function runAutoRemoteNotesSync(): Promise<void> {
 }
 
 export async function runRemoteNotesBackupWithSyncState(action: "upload" | "download" | "sync") {
-  const { remoteBackupMutationVersion: before = 0 } = await chrome.storage.local.get("remoteBackupMutationVersion");
+  const { remoteBackupMutationVersion: before } = await syncStorage();
   const result = await remoteNotesBackup(action);
   if (action === "sync") {
-    const latest = await chrome.storage.local.get(["settings", "remoteBackupMutationVersion"]);
+    const latest = await syncStorage();
     if (latest.settings?.remoteBackupAutoSync) {
       if ((Number(latest.remoteBackupMutationVersion) || 0) === (Number(before) || 0)) {
         await chrome.storage.local.set({
@@ -273,9 +306,6 @@ export async function runRemoteNotesBackupWithSyncState(action: "upload" | "down
 }
 
 export async function getRemoteNotesSyncState() {
-  const { settings = {}, remoteBackupSyncState = { status: "idle" } } = await chrome.storage.local.get([
-    "settings",
-    "remoteBackupSyncState"
-  ]);
+  const { settings, remoteBackupSyncState } = await syncStorage();
   return { enabled: Boolean(settings.remoteBackupAutoSync), state: remoteBackupSyncState };
 }

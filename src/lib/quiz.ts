@@ -41,9 +41,25 @@ function quizIdFor(question: string, options: QuizOption[]): string {
 
 function cleanQuizText(value: string): string {
   return String(value || "")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
     .replace(/^\*\*|\*\*$/g, "")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+export function stripQuizQuestionPrefix(value: string): string {
+  let text = String(value || "").trim();
+  for (let pass = 0; pass < 3; pass += 1) {
+    const next = text
+      .replace(/^(?:\*\*|__)?(?:Q\s*\d+|第\s*\d+\s*题|\(\d+\)|（\d+）|\d+\s*[.、:：)\]])(?:\*\*|__)?\s*/iu, "")
+      .replace(/^(?:\*\*|__)?[\[【(（]\s*(?:题干|题目|问题|单选|单选题)(?:\s*\d+)?\s*[\]】)）](?:\*\*|__)?\s*[：:.\-—]?\s*/u, "")
+      .replace(/^(?:\*\*|__)?(?:题干|题目)(?:\s*\d+)?(?:\*\*|__)?\s*(?:[：:.\-—]\s*|\s+(?=\S{2,}))/u, "")
+      .replace(/^(?:\*\*|__)?(?:问题|单选|单选题)(?:\s*\d+)?(?:\*\*|__)?\s*[：:.\-—]\s*/u, "")
+      .trim();
+    if (next === text) break;
+    text = next;
+  }
+  return text;
 }
 
 export function parseQuizQuestions(markdown: string): QuizQuestion[] {
@@ -61,7 +77,11 @@ export function parseQuizQuestions(markdown: string): QuizQuestion[] {
     const timestamp = rawQuestion.match(/\[(\d{1,2}:\d{2}(?::\d{2})?)\]/)?.[1]
       || explanation.match(/\[(\d{1,2}:\d{2}(?::\d{2})?)\]/)?.[1]
       || "";
-    const question = rawQuestion.replace(/\s*\[\d{1,2}:\d{2}(?::\d{2})?\]\s*/g, " ").replace(/\s+/g, " ").trim();
+    const question = stripQuizQuestionPrefix(
+      rawQuestion.replace(/\s*\[\d{1,2}:\d{2}(?::\d{2})?\]\s*/g, " ")
+    )
+      .replace(/\s+/g, " ")
+      .trim();
     const answer = current.answer.toUpperCase();
     const valid = Boolean(
       question
@@ -92,20 +112,41 @@ export function parseQuizQuestions(markdown: string): QuizQuestion[] {
     const fenceMatch = line.match(/^(`{3,}|~{3,})/);
     if (fenceMatch) {
       const marker = fenceMatch[1]![0]!;
-      if (!fence) fence = marker;
-      else if (fence === marker) fence = null;
+      if (!fence) {
+        fence = marker;
+        if (current && !current.options.length && !current.answer && !readingExplanation) {
+          current.questionLines.push("__KEJI_FENCE_OPEN__");
+        }
+      } else if (fence === marker) {
+        fence = null;
+        if (current && current.questionLines.includes("__KEJI_FENCE_OPEN__")) {
+          const openIdx = current.questionLines.lastIndexOf("__KEJI_FENCE_OPEN__");
+          const codeBody = current.questionLines.splice(openIdx).slice(1).map((l) => l.trim()).filter(Boolean).join("; ");
+          if (codeBody) current.questionLines.push(`\`${codeBody}\``);
+        }
+      }
       continue;
     }
-    if (fence) continue;
+    if (fence) {
+      if (current && current.questionLines.includes("__KEJI_FENCE_OPEN__")) {
+        current.questionLines.push(line);
+      }
+      continue;
+    }
 
-    const headingMatch = line.match(/^#{1,6}\s+(?:(?:Q|第)?\s*\d+\s*[题.、:：)\]]?\s*)?(.+)$/i);
-    const plainQuestionMatch = !headingMatch
-      ? line.match(/^(?:\*\*)?Q\s*\d+\s*[.、:：)\]]\s*(.+?)(?:\*\*)?$/i)
+    const numberedHeadingMatch = line.match(/^#{1,6}\s+(?:(?:Q|第)\s*\d+\s*(?:[题.、:：)\]]\s*|$)|\d+\s*[题.、:：)\]]\s*)(.*)$/i);
+    const headingMatch = numberedHeadingMatch || line.match(/^#{1,6}\s+(.+)$/);
+    const plainQuestionMatch: RegExpMatchArray | null = !headingMatch
+      ? (line.match(/^(?:\*\*)?Q\s*\d+\s*[.、:：)\]]?\s*(.+?)(?:\*\*)?$/i)
+        || (current && current.options.length >= 2
+          ? line.match(/^(?:\*\*)?(?:第\s*\d+\s*题|\d+\s*[.、:：)\]])\s*(.+?)(?:\*\*)?$/i)
+          : null))
       : null;
     if (headingMatch || plainQuestionMatch) {
       finalize();
+      const firstLine: string = (headingMatch?.[1] || plainQuestionMatch?.[1] || "").trim();
       current = {
-        questionLines: [(headingMatch?.[1] || plainQuestionMatch?.[1] || "").trim()],
+        questionLines: firstLine ? [firstLine] : [],
         options: [],
         answer: "",
         explanationLines: [],
@@ -114,7 +155,8 @@ export function parseQuizQuestions(markdown: string): QuizQuestion[] {
       continue;
     }
     if (!current) continue;
-    if (!line) {
+    if (!line) continue;
+    if (/^(?:---+|___+|\*\*\*+)$/.test(line)) {
       readingExplanation = false;
       continue;
     }
@@ -136,15 +178,16 @@ export function parseQuizQuestions(markdown: string): QuizQuestion[] {
       continue;
     }
 
-    const explanationMatch = line.match(/^(?:>\s*)?(?:\*\*)?(?:答案)?(?:解析|解释|Explanation)(?:\*\*)?\s*[：:]\s*(.*)$/i);
+    const explanationMatch = line.match(/^(?:>\s*)?(?:\*\*)?(?:答案)?(?:解析|解释|Explanation)(?:\*\*)?\s*[：:]\s*(?:\*\*)?\s*(.*)$/i);
     if (explanationMatch) {
       readingExplanation = true;
-      if (explanationMatch[1]!.trim()) current.explanationLines.push(explanationMatch[1]!.trim());
+      const rest = explanationMatch[1]!.trim();
+      if (rest && rest !== "**") current.explanationLines.push(rest);
       continue;
     }
 
-    if (readingExplanation && /^>\s*/.test(line)) {
-      current.explanationLines.push(line.replace(/^>\s*/, "").trim());
+    if (readingExplanation) {
+      current.explanationLines.push(line.replace(/^(?:>\s*|[-*+]\s+)/, "").trim());
     } else if (!current.options.length && !current.answer) {
       current.questionLines.push(line);
     }
@@ -185,6 +228,15 @@ export function retainMatchingQuizState(
   const retainedAnswers: Record<string, string> = {};
   for (const [id, choice] of Object.entries(state.answers || {})) {
     if (validIds.has(id) && choice) retainedAnswers[id] = choice;
+  }
+  if (state.generatedMarkdown !== undefined) {
+    const nextGenerated = String(markdown || state.generatedMarkdown || "").trim();
+    if (!nextGenerated && !Object.keys(retainedAnswers).length) return undefined;
+    return {
+      ...(nextGenerated ? { generatedMarkdown: nextGenerated } : {}),
+      answers: retainedAnswers,
+      updatedAt: state.updatedAt || new Date().toISOString()
+    };
   }
   return Object.keys(retainedAnswers).length
     ? { answers: retainedAnswers, updatedAt: state.updatedAt || new Date().toISOString() }

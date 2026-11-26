@@ -14,8 +14,7 @@ import {
   type FlashcardItem,
   type FlashcardReviewState,
 } from '../flashcards.ts';
-import { Keji } from '../keji.ts';
-import { getNoteStructure } from '../note-structures.ts';
+import { Keji, type KeyFrameItem } from '../keji.ts';
 import { callBackground, downloadText, showNotice } from './ui.ts';
 
 interface FlashcardSession {
@@ -26,6 +25,7 @@ interface FlashcardSession {
   retryCounts: Map<string, number>;
   reviewed: number;
   crossNote: boolean;
+  sourceMarkdown: string;
 }
 
 interface FlashcardHostHooks {
@@ -37,21 +37,26 @@ interface ActiveNoteContext {
   noteId: string | null;
   title: string;
   markdown: string;
+  transcript: string;
+  frames: KeyFrameItem[];
   template: string;
   videoUrl: string;
   editing: boolean;
   reviewStates: FlashcardReviewState[];
+  flashcardMarkdown: string;
 }
 
 export const flashcardState = $state({
   showAnkiExport: false,
-  showReviewButton: false,
-  reviewLabel: '开始复习',
+  hasCards: false,
+  canGenerate: false,
+  generating: false,
+  tabBadge: '',
   dueCount: 0,
   loadingDue: false,
   dueButtonLabel: '复习到期闪卡',
   dueButtonTitle: '复习笔记库中所有已到期的闪卡',
-  visible: false,
+  crossNote: false,
   cardVisible: true,
   finished: false,
   answerRevealed: false,
@@ -66,42 +71,67 @@ export const flashcardState = $state({
   sourceLabel: '',
   hardInterval: '1 天',
   goodInterval: '1 天',
-  focusTrigger: 0,
 });
 
 const activeNote: ActiveNoteContext = {
   noteId: null,
   title: '',
   markdown: '',
+  transcript: '',
+  frames: [],
   template: 'study',
   videoUrl: '',
   editing: false,
   reviewStates: [],
+  flashcardMarkdown: '',
 };
 
 let session: FlashcardSession | null = null;
+let generatingCardsNoteId: string | null = null;
 let host: FlashcardHostHooks = {
   enterCrossNoteReviewView: () => {},
   exitCrossNoteReviewView: () => {},
 };
 
+function flashcardContextKey(noteId: string | null): string {
+  return noteId ?? '__unsaved__';
+}
+
 function sessionKeyFor(card: FlashcardItem): string {
   return `${card.noteId || activeNote.noteId || ''}:${card.id}`;
 }
 
+function activeCardSourceMarkdown(): string {
+  if (activeNote.flashcardMarkdown) return activeNote.flashcardMarkdown;
+  return activeNote.markdown;
+}
+
+export function getActiveFlashcardCopyMarkdown(): string {
+  const source = activeCardSourceMarkdown();
+  return parseFlashcards(source).length ? source : '';
+}
+
 function updateNoteButtonVisibility(): void {
-  if (activeNote.editing || !activeNote.markdown) {
+  if (activeNote.editing) {
+    flashcardState.generating = false;
     flashcardState.showAnkiExport = false;
-    flashcardState.showReviewButton = false;
+    flashcardState.hasCards = false;
+    flashcardState.canGenerate = false;
+    flashcardState.tabBadge = '';
     return;
   }
-  const cards = parseFlashcards(activeNote.markdown);
-  const supportsCards = Boolean(getNoteStructure(activeNote.template).supportsFlashcards);
-  flashcardState.showAnkiExport = supportsCards || cards.length > 0;
-  flashcardState.showReviewButton = cards.length > 0;
+  flashcardState.generating = Boolean(
+    generatingCardsNoteId && generatingCardsNoteId === flashcardContextKey(activeNote.noteId)
+  );
+  const cards = parseFlashcards(activeCardSourceMarkdown());
+  flashcardState.canGenerate = Boolean(activeNote.markdown.trim() || activeNote.transcript.trim());
+  flashcardState.hasCards = cards.length > 0;
+  flashcardState.showAnkiExport = cards.length > 0;
   if (cards.length) {
     const dueCount = getDueFlashcards(cards, activeNote.reviewStates, Date.now()).length;
-    flashcardState.reviewLabel = dueCount ? `复习到期闪卡 · ${dueCount}` : `练习闪卡 · ${cards.length}`;
+    flashcardState.tabBadge = dueCount ? `${dueCount} 待复习` : `${cards.length} 张`;
+  } else {
+    flashcardState.tabBadge = '';
   }
 }
 
@@ -122,7 +152,7 @@ function renderCurrentCard(): void {
     flashcardState.finished = true;
     flashcardState.progress = `本轮完成 · 已复习 ${session.reviewed} 张`;
     flashcardState.finishedCopy = session.missed.length
-      ? `有 ${session.missed.length} 张需要再看一遍。复习记录已保存在本机。`
+      ? `有 ${session.missed.length} 张标记为「重来」，建议再巩固一遍。复习记录已保存在本机。`
       : '这轮全部完成。复习记录已保存在本机。';
     flashcardState.hasMissed = Boolean(session.missed.length);
     if (session.crossNote) void refreshDueFlashcardCount();
@@ -148,19 +178,24 @@ function exportCardsToAnki(cards: FlashcardItem[], title: string, addCourseTag: 
   const safeTitle = safeFilename(title, '课程闪卡');
   const tsv = formatAnkiTsv(cards, { addCourseTag });
   downloadText(`${safeTitle}-anki.tsv`, tsv, 'text/tab-separated-values;charset=utf-8');
-  showNotice(`已导出 ${cards.length} 张 Anki 闪卡 TSV。`, 'success');
+  showNotice(`已导出 ${cards.length} 张 Anki 闪卡（.tsv）。`, 'success');
 }
 
 export function configureFlashcardHost(hooks: FlashcardHostHooks): void {
   host = hooks;
 }
 
-export function setActiveNoteFlashcardReview(review: FlashcardReviewState[] = []): void {
+export function setActiveNoteFlashcardData(review: FlashcardReviewState[] = [], flashcardMarkdown = ''): void {
   activeNote.reviewStates = Array.isArray(review) ? [...review] : [];
+  activeNote.flashcardMarkdown = String(flashcardMarkdown || '');
 }
 
 export function getActiveNoteFlashcardReview(): FlashcardReviewState[] {
   return [...activeNote.reviewStates];
+}
+
+export function getActiveNoteFlashcardMarkdown(): string {
+  return activeNote.flashcardMarkdown;
 }
 
 export function pruneActiveNoteFlashcardReview(markdown: string): void {
@@ -170,18 +205,26 @@ export function pruneActiveNoteFlashcardReview(markdown: string): void {
 
 export function closeFlashcardSessionQuietly(): void {
   session = null;
-  flashcardState.visible = false;
+  flashcardState.crossNote = false;
+  flashcardState.finished = false;
+  flashcardState.answerRevealed = false;
+  flashcardState.ratingsVisible = false;
 }
 
-export function syncActiveNoteFlashcards(context: Omit<ActiveNoteContext, 'reviewStates'>): void {
+export function syncActiveNoteFlashcards(context: Omit<ActiveNoteContext, 'reviewStates' | 'flashcardMarkdown'>): void {
   activeNote.noteId = context.noteId;
   activeNote.title = context.title;
   activeNote.markdown = context.markdown;
+  activeNote.transcript = context.transcript;
+  activeNote.frames = [...context.frames];
   activeNote.template = context.template;
   activeNote.videoUrl = context.videoUrl;
   activeNote.editing = context.editing;
   if (context.editing) closeFlashcardSessionQuietly();
   updateNoteButtonVisibility();
+  if (!context.editing && flashcardState.hasCards && (!session || (!session.crossNote && session.sourceMarkdown !== activeCardSourceMarkdown()))) {
+    startFlashcardReviewSession();
+  }
 }
 
 export async function refreshDueFlashcardCount(): Promise<void> {
@@ -189,14 +232,14 @@ export async function refreshDueFlashcardCount(): Promise<void> {
   if (result?.ok) setDueCount(result.cards?.length || 0);
 }
 
-export function startFlashcardReview(cards: FlashcardItem[] | null = null): void {
-  const allNoteCards = parseFlashcards(activeNote.markdown);
+function startFlashcardReviewSession(cards: FlashcardItem[] | null = null): void {
+  const crossNoteSeed = Boolean(cards?.some((card) => Boolean(card.noteId)));
+  const sourceMarkdown = crossNoteSeed ? '' : activeCardSourceMarkdown();
+  const allNoteCards = parseFlashcards(activeCardSourceMarkdown());
   const dueCards = getDueFlashcards(allNoteCards, activeNote.reviewStates);
   const queue = cards || (dueCards.length ? dueCards : allNoteCards);
-  if (!queue.length) {
-    showNotice('这份笔记里没有可复习的闪卡。', 'error');
-    return;
-  }
+  if (!queue.length) return;
+  const crossNote = queue.some((card) => Boolean(card.noteId));
   session = {
     allCards: [...queue],
     queue: [...queue],
@@ -204,17 +247,59 @@ export function startFlashcardReview(cards: FlashcardItem[] | null = null): void
     missed: [],
     retryCounts: new Map(),
     reviewed: 0,
-    crossNote: queue.some((card) => Boolean(card.noteId)),
+    crossNote,
+    sourceMarkdown,
   };
-  flashcardState.visible = true;
-  flashcardState.focusTrigger += 1;
+  flashcardState.crossNote = crossNote;
   renderCurrentCard();
 }
 
+export async function generateFlashcardsForActiveNote(): Promise<void> {
+  if ((!activeNote.markdown.trim() && !activeNote.transcript.trim()) || generatingCardsNoteId) return;
+  const targetNoteId = activeNote.noteId;
+  const targetKey = flashcardContextKey(targetNoteId);
+  generatingCardsNoteId = targetKey;
+  updateNoteButtonVisibility();
+  showNotice('正在提炼本节记忆闪卡…', 'info');
+  try {
+    const result = await callBackground('GENERATE_NOTE_FLASHCARDS', {
+      payload: {
+        title: activeNote.title,
+        markdown: activeNote.markdown,
+        transcript: activeNote.transcript,
+        frames: activeNote.frames.slice(0, 6),
+      },
+    });
+    if (!result?.ok) throw new Error(result?.error || '生成记忆闪卡失败。');
+    const generatedMd = String(result.result.markdown || '');
+    if (targetNoteId) {
+      await callBackground('UPDATE_NOTE_FLASHCARDS', {
+        id: targetNoteId,
+        flashcardMarkdown: generatedMd,
+        flashcardReview: [],
+      });
+    }
+    if (activeNote.noteId === targetNoteId) {
+      activeNote.flashcardMarkdown = generatedMd;
+      activeNote.reviewStates = [];
+      updateNoteButtonVisibility();
+      startFlashcardReviewSession();
+      showNotice(`已生成 ${result.result.count} 张记忆闪卡。`, 'success');
+    } else {
+      showNotice(`原笔记的 ${result.result.count} 张记忆闪卡已在后台保存。`, 'success');
+    }
+  } catch (error) {
+    showNotice((error as Error).message || '生成记忆闪卡失败。', 'error');
+  } finally {
+    if (generatingCardsNoteId === targetKey) generatingCardsNoteId = null;
+    updateNoteButtonVisibility();
+  }
+}
+
 export function closeFlashcardReview(): void {
-  const wasCrossNoteOnly = Boolean(session?.crossNote && !activeNote.markdown);
+  const wasCrossNote = Boolean(session?.crossNote);
   closeFlashcardSessionQuietly();
-  if (wasCrossNoteOnly) host.exitCrossNoteReviewView();
+  if (wasCrossNote) host.exitCrossNoteReviewView();
 }
 
 export function revealFlashcard(): void {
@@ -223,19 +308,20 @@ export function revealFlashcard(): void {
 }
 
 export function retryMissedFlashcards(): void {
-  startFlashcardReview(session?.missed || []);
+  startFlashcardReviewSession(session?.missed || []);
 }
 
 export function restartFlashcards(): void {
-  startFlashcardReview(session?.allCards || parseFlashcards(activeNote.markdown));
+  startFlashcardReviewSession(session?.allCards || parseFlashcards(activeCardSourceMarkdown()));
 }
 
-export function handleFlashcardKeydown(event: KeyboardEvent): void {
-  if (event.defaultPrevented || !flashcardState.visible || event.altKey || event.ctrlKey || event.metaKey) return;
+export function handleFlashcardKeydown(event: KeyboardEvent, activeTabIsFlashcards = false): void {
+  if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey) return;
+  if (!flashcardState.crossNote && !activeTabIsFlashcards) return;
   const target = event.target;
   if (target instanceof HTMLElement && target.closest("input, textarea, select, [contenteditable='true']")) return;
-  if (event.key === 'Escape') closeFlashcardReview();
-  else if (event.code === 'Space' && !flashcardState.answerRevealed) {
+  if (event.key === 'Escape' && flashcardState.crossNote) closeFlashcardReview();
+  else if (event.code === 'Space' && flashcardState.hasCards && !flashcardState.answerRevealed && !flashcardState.finished) {
     event.preventDefault();
     revealFlashcard();
   } else if (!flashcardState.ratingsVisible) return;
@@ -305,7 +391,7 @@ export async function startDueFlashcardReview(): Promise<void> {
       return;
     }
     host.enterCrossNoteReviewView();
-    startFlashcardReview(result.cards);
+    startFlashcardReviewSession(result.cards);
   } catch (error) {
     showNotice((error as Error).message || '读取到期闪卡失败。', 'error');
   } finally {
@@ -314,7 +400,7 @@ export async function startDueFlashcardReview(): Promise<void> {
 }
 
 export function exportAnkiTsv(): void {
-  const cards = parseFlashcards(activeNote.markdown);
+  const cards = parseFlashcards(activeCardSourceMarkdown());
   if (!cards.length) {
     showNotice('没有找到闪卡表格，请重新生成或检查笔记格式。', 'error');
     return;

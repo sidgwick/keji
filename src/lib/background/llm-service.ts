@@ -1,12 +1,30 @@
+import { parseFlashcards } from "../flashcards.ts";
 import {
   Keji,
-  type ApiProtocol,
   type DiscussionMode,
   type KejiSettings,
   type KeyFrameItem,
+  type ModelPreset,
   type VideoTarget,
 } from "../keji.ts";
 import { downloadAndCacheVideo, getCachedMuxedVideo, getCachedVideo, isBilibiliCdnUrl } from "../lesson-cache.ts";
+import {
+  applyGlobalSynthesisResult,
+  applyVisualFrameReviewToMarkdown,
+  applyVisualPatchToMarkdown,
+  buildGlobalSynthesisPrompts,
+  buildStructuredNotePrompts,
+  compileFlashcardsResponseToMarkdown,
+  compileQuizResponseToMarkdown,
+  compileStructuredNoteToMarkdown,
+  extractMarkdownOutline,
+  parseDiscussionReviseResponse,
+  parseModelJson,
+  parseStructuredNoteResponse,
+  salvageLooseJsonToMarkdown,
+  type OutlineSectionItem,
+  type StructuredNoteData,
+} from "../note-schema.ts";
 import { resolveNoteStructurePrompt } from "../note-structures.ts";
 import { parseQuizQuestions } from "../quiz.ts";
 import { configureBilibiliCdnRequestHeaders } from "./bilibili.ts";
@@ -63,49 +81,43 @@ export function cancelGenerationTask(taskId = ""): void {
 export function normalizeSettings(storedSettings: Partial<KejiSettings> | null | undefined): KejiSettings {
   const stored = (storedSettings || {}) as Partial<KejiSettings> & Record<string, unknown>;
   const normalized: KejiSettings = { ...Keji.defaultSettings, ...stored };
-  normalized.apiProtocol = Keji.normalizeProtocol(stored.apiProtocol, normalized.baseUrl);
   normalized.modelCapability = Keji.normalizeCapability(stored.modelCapability, stored.videoInputMode);
-  delete (normalized as Record<string, unknown>).underlyingModel;
-  delete (normalized as Record<string, unknown>).videoInputMode;
-  if (!Object.prototype.hasOwnProperty.call(stored, "transcriptionApiKey")) {
-    normalized.transcriptionApiKey = stored.apiKey || "";
-  }
+  delete (normalized as unknown as Record<string, unknown>).apiProtocol;
+  delete (normalized as unknown as Record<string, unknown>).underlyingModel;
+  delete (normalized as unknown as Record<string, unknown>).videoInputMode;
+  delete (normalized as unknown as Record<string, unknown>).transcriptionLanguage;
+  delete (normalized as unknown as Record<string, unknown>).transcriptionConcurrency;
+  normalized.modelPresets = Array.isArray(stored.modelPresets)
+    ? stored.modelPresets
+      .filter((preset): preset is ModelPreset => Boolean(preset && typeof preset.id === "string"))
+      .map((preset) => ({
+        id: String(preset.id),
+        name: String(preset.name || preset.model || "预设"),
+        baseUrl: String(preset.baseUrl || "").trim().replace(/\/+$/, ""),
+        model: String(preset.model || "").trim(),
+        modelCapability: Keji.normalizeCapability(preset.modelCapability),
+        apiKey: String(preset.apiKey || "").trim()
+      }))
+    : [];
+  normalized.activePresetId = String(stored.activePresetId || "");
   return normalized;
 }
 
-function buildImageBlock(protocol: ApiProtocol, dataUrl: string) {
-  if (protocol === "mimo") {
-    return { type: "image_url" as const, image_url: { url: String(dataUrl || "") } };
-  }
+function buildImageBlock(dataUrl: string) {
   return { type: "image_url" as const, image_url: { url: String(dataUrl || ""), detail: "high" as const } };
 }
 
-function buildVideoBlock(protocol: ApiProtocol, videoDataUrl: string, durationSeconds = 0) {
-  const url = String(videoDataUrl || "");
-  if (protocol === "mimo") {
-    const seconds = Math.max(0, Number(durationSeconds) || 0);
-    const fps = seconds ? Number(Math.min(2, Math.max(0.2, 600 / seconds)).toFixed(2)) : 1;
-    return {
-      type: "video_url" as const,
-      video_url: { url },
-      fps: Math.max(0.1, Math.min(10, fps)),
-      media_resolution: "default" as const
-    };
-  }
-  return { type: "video_url" as const, video_url: { url } };
+function buildVideoBlock(videoDataUrl: string) {
+  return { type: "video_url" as const, video_url: { url: String(videoDataUrl || "") } };
 }
 
-function buildAudioBlock(protocol: ApiProtocol, base64Audio: string, format: "wav" | "mp3" = "wav") {
+function buildAudioBlock(base64Audio: string, format: "wav" | "mp3" = "wav") {
   const raw = String(base64Audio || "").replace(/^data:[^;]+;base64,/i, "");
-  if (protocol === "mimo") {
-    const mime = format === "mp3" ? "audio/mpeg" : "audio/wav";
-    return { type: "input_audio" as const, input_audio: { data: `data:${mime};base64,${raw}` } };
-  }
   return { type: "input_audio" as const, input_audio: { data: raw, format } };
 }
 
 async function resolveChatClient(overrideSettings: Partial<KejiSettings> | null = null, { fallbackTemperature = 0.3 } = {}) {
-  const storedSettings = overrideSettings || (await chrome.storage.local.get("settings")).settings;
+  const storedSettings = overrideSettings || (await chrome.storage.local.get("settings")).settings as Partial<KejiSettings>;
   const settings = normalizeSettings(storedSettings);
   const baseUrl = String(settings.baseUrl || "").trim().replace(/\/+$/, "");
   const model = String(settings.model || "").trim();
@@ -151,9 +163,64 @@ function stripInlineImagesForPrompt(markdown: string): string {
 }
 
 function unwrapOuterCodeFence(text: string): string {
-  const trimmed = String(text || "").trim();
+  const trimmed = String(text || "").replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
   const match = trimmed.match(/^`{3,}[a-zA-Z0-9_-]*\r?\n([\s\S]*?)\r?\n`{3,}$/);
   return match ? match[1]!.trim() : trimmed;
+}
+
+function stripRedundantMarkdownTitle(markdown: string): string {
+  const trimmed = String(markdown || "").trim();
+  if (!/^#\s+[^\n]+/.test(trimmed) || !/^##\s+/m.test(trimmed)) return trimmed;
+  return trimmed
+    .replace(/^#\s+[^\n]+\s*\r?\n+/, "")
+    .replace(/^---+\s*\r?\n+/, "")
+    .trim();
+}
+
+async function postChatCompletion({
+  endpoint,
+  headers,
+  body,
+  signal,
+  jsonMode = false,
+  timeoutMs = 300_000,
+}: {
+  endpoint: string;
+  headers: Record<string, string>;
+  body: Record<string, unknown>;
+  signal?: AbortSignal;
+  jsonMode?: boolean;
+  timeoutMs?: number;
+}): Promise<{ response: Response; result: any }> {
+  const timeoutSignal = AbortSignal.timeout(timeoutMs);
+  const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+  const send = async (useJsonFormat: boolean) => {
+    const payload = useJsonFormat
+      ? { ...body, response_format: { type: "json_object" } }
+      : body;
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers,
+      signal: requestSignal,
+      body: JSON.stringify(payload)
+    });
+    const result = await response.json().catch(() => null);
+    return { response, result };
+  };
+
+  try {
+    const first = await send(jsonMode);
+    if (!first.response.ok && jsonMode && first.response.status === 400) {
+      const errMsg = String(first.result?.error?.message || first.result?.message || "");
+      if (/response_format|json_object|json_schema|structured|unsupported|grammar/i.test(errMsg)) {
+        return send(false);
+      }
+    }
+    return first;
+  } catch (error) {
+    if (timeoutSignal.aborted && !signal?.aborted) throw new Error(`模型请求超时（${Math.round(timeoutMs / 1000)} 秒）。`);
+    throw error;
+  }
 }
 
 export async function testModelConnection(input: Partial<KejiSettings>) {
@@ -204,10 +271,15 @@ export async function generateNote(
 
   const video = payload.video || {};
   const priorMarkdown = String(payload.partialMarkdown || "").trim();
-  const lockedHeadings = [...new Set(priorMarkdown.match(/^#{2,3}\s+.+$/gm) || [])];
+  const providedOutline: OutlineSectionItem[] = Array.isArray(payload.partialOutline)
+    ? payload.partialOutline.filter((item: any) => item && typeof item.title === "string")
+    : [];
+  const baseOutline = providedOutline.length ? providedOutline : extractMarkdownOutline(priorMarkdown, 18);
+
   let index = 0;
   let totalCount = 1;
   let continuation = false;
+  let useJsonMode = false;
   let messages: Array<{ role: "system" | "user"; content: any }>;
 
   if (payload.audioChunk) {
@@ -218,97 +290,85 @@ export async function generateNote(
     index = Math.max(0, Math.floor(Number(chunk.index) || 0));
     totalCount = Math.max(1, Math.floor(Number(chunk.total) || 1));
     continuation = index > 0;
-    if (continuation && !priorMarkdown) throw new Error("续跑数据缺失，请从头重新生成笔记。");
+    if (continuation && !priorMarkdown && !baseOutline.length) throw new Error("续跑数据缺失，请从头重新生成笔记。");
     const start = Math.max(0, Number(chunk.start) || 0);
     const end = Math.max(start, Number(chunk.end) || 0);
 
     const wavBase64 = await encodeAudioChunk({ video, start, end });
-    const audioBlock = buildAudioBlock(settings.apiProtocol, wavBase64, "wav");
-    const timeRangeLabel = end > start ? `${Keji.formatTime(start)}–${Keji.formatTime(end)}` : `从 ${Keji.formatTime(start)} 起`;
-    const system = [
-      "你是一名严谨的课程笔记助手。请仔细聆听这段课程音频，使用中文生成结构清楚、方便复习的 Markdown。",
-      "只根据音频中实际讲授的内容写作；不得补造课程未提及的结论或代码。",
-      `本段音频在整节视频中的绝对起始时间为 ${Keji.formatTime(start)}（+${Math.floor(start)} 秒）。请在每个要点旁标注叠加该起始时间后的完整视频时间戳 [MM:SS] 或 [HH:MM:SS]。`,
-      totalCount === 1
-        ? "请根据课程讲解重点挑选 1 到 5 个最值得配图或回看的时刻，在对应段落后输出 [[KEYFRAME: HH:MM:SS | 该时刻讲解重点]]。"
-        : `这是第 ${index + 1}/${totalCount} 个音频分段（视频时间范围 ${timeRangeLabel}）。请只整理本分段新增内容，并挑选最多 1 个值得配图的时刻输出 [[KEYFRAME: HH:MM:SS | 该时刻讲解重点]]；不得复用前面分段的内容。`,
-      continuation ? "章节锁定：沿用已有章节标题与顺序，只把本段新增内容归入对应章节；确实无法归类时才在末尾新增章节。" : "",
-      continuation && lockedHeadings.length ? `已锁定章节：\n${lockedHeadings.join("\n")}` : "",
-      "不要输出代码围栏包裹的整篇文档。"
-    ].filter(Boolean);
-    const userText = [
-      `视频：${video.title || "未命名视频"}`,
-      `分 P：${video.part || "当前分 P"}（第 ${video.page || 1}/${video.pageCount || 1} 节）`,
-      `音频范围：${timeRangeLabel}（第 ${index + 1}/${totalCount} 段）`,
-      `整理模板：${template.label}`,
-      `任务：${task}`,
-      continuation && lockedHeadings.length ? `已锁定章节标题：\n${lockedHeadings.join("\n")}` : ""
-    ].filter(Boolean).join("\n\n");
+    const audioBlock = buildAudioBlock(wavBase64, "wav");
+    const prompt = buildStructuredNotePrompts({
+      templateId: template.id,
+      task,
+      templateLabel: template.label,
+      videoTitle: video.title,
+      videoPart: video.part,
+      page: video.page,
+      pageCount: video.pageCount,
+      isAudioChunk: true,
+      chunkIndex: index,
+      totalChunks: totalCount,
+      audioStart: start,
+      audioEnd: end,
+      outline: continuation ? baseOutline : undefined
+    });
     messages = [
-      { role: "system", content: system.join("\n") },
-      { role: "user", content: [{ type: "text", text: userText }, audioBlock] }
+      { role: "system", content: prompt.system },
+      { role: "user", content: [{ type: "text", text: prompt.userText }, audioBlock] }
     ];
   } else {
     const transcript = String(payload.transcript || "").trim();
     if (!transcript) throw new Error("请先读取字幕，或粘贴一份文字稿。");
-    const chunks = Keji.splitTranscript(transcript);
+    const chunkMaxChars = Math.max(1000, Math.min(12000, Math.floor(Number(payload.chunkMaxChars) || 12000)));
+    const chunks = Keji.splitTranscript(transcript, chunkMaxChars);
     totalCount = chunks.length;
     index = Math.max(0, Math.min(totalCount - 1, Math.floor(Number(payload.resumeFrom) || 0)));
     continuation = index > 0;
-    if (continuation && !priorMarkdown) throw new Error("续跑数据缺失，请从头重新生成笔记。");
+    if (continuation && !priorMarkdown && !baseOutline.length) throw new Error("续跑数据缺失，请从头重新生成笔记。");
+    const promptOutline = chunkMaxChars < 4000 ? baseOutline.slice(-12) : baseOutline;
+    const contextOverlapChars = Math.min(600, Math.max(120, Math.floor(chunkMaxChars * 0.1)));
+    const previousContext = index > 0 ? chunks[index - 1]!.slice(-contextOverlapChars) : "";
+    const nextContext = index + 1 < totalCount ? chunks[index + 1]!.slice(0, contextOverlapChars) : "";
 
-    const system = [
-      "你是一名严谨的课程笔记助手。请使用中文生成结构清楚、方便复习的 Markdown。",
-      "只根据提供的课程文字写作；不确定的信息要明确标注，不得补造视频没有讲过的内容。",
-      "文字稿中的时间戳要保留在相关段落旁，使用 [时间] 格式。",
-      totalCount === 1
-        ? "请根据课程讲解内容，从文字稿中判断 1 到 5 个最值得回看或配图的时刻，并在对应笔记段落后单独输出标记 [[KEYFRAME: HH:MM:SS | 该时刻讲解重点]]。选择应由课程内容的重要性和上下文决定，不要按固定时间间隔抽样。"
-        : "这是长视频分段整理的一部分。请只处理当前片段，并从当前片段中挑选最多 1 个最值得回看或配图的时刻；在对应笔记段落后单独输出标记 [[KEYFRAME: HH:MM:SS | 该时刻讲解重点]]。选择应由讲解内容的重要性决定，不要按固定时间间隔抽样。",
-      "标记时间必须取自文字稿中已有的时间戳；不要编造时间。你只能看到文字稿，不能判断视频画面中具体出现了什么，因此说明只概括该时刻讲解的内容，不描述未经文字稿确认的画面。没有可靠时间戳时不要生成截图标记。",
-      "每个标记会由扩展截取对应时刻的实际视频画面，并嵌入笔记。",
-      "不要输出代码围栏包裹的整篇文档。"
+    const prompt = buildStructuredNotePrompts({
+      templateId: template.id,
+      task,
+      templateLabel: template.label,
+      videoTitle: video.title,
+      videoPart: video.part,
+      page: video.page,
+      pageCount: video.pageCount,
+      isAudioChunk: false,
+      chunkIndex: index,
+      totalChunks: totalCount,
+      transcriptChunk: chunks[index],
+      previousContext,
+      nextContext,
+      outline: continuation ? promptOutline : undefined
+    });
+    useJsonMode = true;
+    messages = [
+      { role: "system", content: prompt.system },
+      { role: "user", content: prompt.userText }
     ];
-    if (totalCount > 1) {
-      system.push(`当前是第 ${index + 1}/${totalCount} 个连续文字片段。只整理本片段中新增的内容，保留其细节、例子、步骤、数据和时间戳；不要写整段视频的总结或结论。`);
-      system.push("相邻片段文字仅用于理解跨边界的语意、术语和未完句；不要把当前片段以外的信息整理进笔记，也不要重复已处理的内容。");
-    }
-    if (continuation) {
-      system.push("章节锁定：沿用首段及后续已建立的章节标题与顺序；只把本段新信息追加到最合适的已有章节。只有确实无法归入现有章节时，才在末尾新增章节。不得重写、压缩或复制前面片段已经整理的内容。输出 Markdown 章节标题和本段新增内容即可。");
-      if (lockedHeadings.length) system.push(`已锁定章节：\n${lockedHeadings.join("\n")}`);
-    }
-
-    const previousContext = index > 0 ? chunks[index - 1]!.slice(-600) : "";
-    const nextContext = index + 1 < totalCount ? chunks[index + 1]!.slice(0, 600) : "";
-    const user = [
-      `视频：${video.title || "未命名视频"}`,
-      `分 P：${video.part || "当前分 P"}（第 ${video.page || 1}/${video.pageCount || 1} 节）`,
-      `整理模板：${template.label}`,
-      `任务：${task}`,
-      continuation ? `续写要求：只输出第 ${index + 1} 段新增的笔记内容。` : "",
-      "",
-      previousContext ? `前一段末尾上下文（仅用于理解承接，不要复述）：\n${previousContext}` : "",
-      continuation ? "以下章节标题已锁定：" : "本段字幕、转写或用户文字稿：",
-      continuation && lockedHeadings.length ? lockedHeadings.join("\n") : "",
-      "",
-      `视频原时间戳不因分段而重置。文字稿片段 ${index + 1}/${totalCount}：`,
-      chunks[index],
-      nextContext ? `后一段开头上下文（仅用于理解承接，不要提前整理）：\n${nextContext}` : ""
-    ].filter((line) => line !== "").join("\n");
-    messages = [{ role: "system", content: system.join("\n") }, { role: "user", content: user }];
   }
 
   const { signal, release } = acquireGenerationSignal(payload.generationTaskId);
   try {
     if (signal?.aborted) throw new CancelledError();
-    const response = await fetch(endpoint, {
-      method: "POST",
+    const { response, result } = await postChatCompletion({
+      endpoint,
       headers,
       signal,
-      body: JSON.stringify({ model, messages, temperature, stream: false })
+      timeoutMs: payload.audioChunk ? 600_000 : 300_000,
+      jsonMode: useJsonMode,
+      body: { model, messages, temperature, stream: false }
     });
-    const result = await response.json().catch(() => null);
     if (!response.ok) {
-      throw new Error(`第 ${index + 1}/${totalCount} 段模型请求失败：${result?.error?.message || result?.message || `HTTP ${response.status}`}`);
+      const rawMessage = String(result?.error?.message || result?.message || `HTTP ${response.status}`);
+      const audioHint = payload.audioChunk && /audio\s+input\s+is\s+not\s+supported|input_audio|unsupported.*audio|mmproj/i.test(rawMessage)
+        ? "（当前模型接口不支持直接输入音频；如使用本地服务请提供音频 mmproj，或在「设置 → 模型与生成」改用文本/图文能力并先语音转写）"
+        : "";
+      throw new Error(`第 ${index + 1}/${totalCount} 段模型请求失败：${rawMessage}${audioHint}`);
     }
     const resolvedModel = String(result?.model || model);
     const choice = result?.choices?.[0];
@@ -319,9 +379,85 @@ export async function generateNote(
     if (choice?.finish_reason === "content_filter") {
       throw new Error(`第 ${index + 1}/${totalCount} 段被模型的内容过滤器提前终止；本段未标记完成，请检查原文后${continuation ? "从本段重试" : "重新生成"}。`);
     }
-    const markdown = extractMessageText(choice).trim();
-    if (!markdown) throw new Error(`模型没有返回第 ${index + 1}/${totalCount} 段内容。`);
-    return { markdown, model: resolvedModel };
+    const rawText = extractMessageText(choice).trim();
+    if (!rawText) throw new Error(`模型没有返回第 ${index + 1}/${totalCount} 段内容。`);
+    const structured = parseStructuredNoteResponse(rawText, template.id);
+    if (structured) {
+      const markdown = compileStructuredNoteToMarkdown(structured, template.id);
+      if (markdown.trim()) return { markdown, model: resolvedModel, structured };
+    }
+    const fallbackObj = parseModelJson<Record<string, unknown> | unknown[]>(rawText);
+    const directObj = !Array.isArray(fallbackObj) && fallbackObj && typeof fallbackObj === "object"
+      ? fallbackObj
+      : null;
+    const directText = typeof directObj?.markdown === "string"
+      ? directObj.markdown.trim()
+      : typeof directObj?.note === "string"
+        ? directObj.note.trim()
+        : typeof directObj?.content === "string"
+          ? directObj.content.trim()
+          : "";
+    const fallbackText = directText
+      ? stripRedundantMarkdownTitle(unwrapOuterCodeFence(directText))
+      : fallbackObj
+        ? stripRedundantMarkdownTitle(salvageLooseJsonToMarkdown(fallbackObj))
+        : stripRedundantMarkdownTitle(unwrapOuterCodeFence(rawText));
+    if (!fallbackText.trim()) throw new Error(`模型没有返回第 ${index + 1}/${totalCount} 段有效笔记内容。`);
+    return { markdown: fallbackText.trim(), model: resolvedModel };
+  } catch (error) {
+    if ((error as Error)?.name === "AbortError" || signal?.aborted) throw new CancelledError();
+    throw error;
+  } finally {
+    release();
+  }
+}
+
+export async function synthesizeNoteOverview(payload: {
+  structured: StructuredNoteData;
+  video?: VideoTarget;
+  generationTaskId?: string;
+}): Promise<{ structured: StructuredNoteData; markdown: string; model: string }> {
+  const prompts = buildGlobalSynthesisPrompts(payload.structured, {
+    title: payload.video?.title,
+    part: payload.video?.part,
+  });
+  if (!prompts) {
+    return {
+      structured: payload.structured,
+      markdown: compileStructuredNoteToMarkdown(payload.structured, payload.structured.kind),
+      model: "",
+    };
+  }
+  const { model, endpoint, headers } = await resolveChatClient(null, { fallbackTemperature: 0.2 });
+  const { signal, release } = acquireGenerationSignal(payload.generationTaskId);
+  try {
+    if (signal?.aborted) throw new CancelledError();
+    const { response, result } = await postChatCompletion({
+      endpoint,
+      headers,
+      signal,
+      jsonMode: true,
+      body: {
+        model,
+        temperature: 0.2,
+        stream: false,
+        messages: [
+          { role: "system", content: prompts.system },
+          { role: "user", content: prompts.userText },
+        ],
+      },
+    });
+    if (!response.ok) {
+      throw new Error(result?.error?.message || result?.message || `全课统合请求失败：HTTP ${response.status}`);
+    }
+    const rawText = extractMessageText(requireCompleteModelChoice(result, "全课总纲收口")).trim();
+    const synthesized = applyGlobalSynthesisResult(payload.structured, rawText);
+    const markdown = compileStructuredNoteToMarkdown(synthesized, synthesized.kind);
+    return {
+      structured: synthesized,
+      markdown: markdown || compileStructuredNoteToMarkdown(payload.structured, payload.structured.kind),
+      model: String(result?.model || model),
+    };
   } catch (error) {
     if ((error as Error)?.name === "AbortError" || signal?.aborted) throw new CancelledError();
     throw error;
@@ -333,8 +469,8 @@ export async function generateNote(
 export async function generateNoteQuiz(payload: any): Promise<{ markdown: string; count: number }> {
   const { settings, model, endpoint, headers, temperature } = await resolveChatClient();
   const noteMarkdown = stripInlineImagesForPrompt(payload.markdown || "");
-  if (!noteMarkdown) throw new Error("当前没有可供出题的笔记内容。");
   const transcriptText = String(payload.transcript || "").trim();
+  if (!noteMarkdown && !transcriptText) throw new Error("当前没有可供出题的笔记或文字稿内容。");
   const allowImages = Keji.supportsImage(settings.modelCapability);
   const frames: KeyFrameItem[] = allowImages
     ? (Array.isArray(payload.frames) ? payload.frames : [])
@@ -347,7 +483,7 @@ export async function generateNoteQuiz(payload: any): Promise<{ markdown: string
     `课程标题：${payload.title || "课程笔记"}`,
     `出题要求：${quizTask}`,
     transcriptText ? `参考课程文字稿：\n${transcriptText}` : "",
-    `参考课程笔记：\n${noteMarkdown}`
+    noteMarkdown ? `参考课程笔记：\n${noteMarkdown}` : ""
   ].filter(Boolean).join("\n\n");
 
   const userContent = frames.length
@@ -355,15 +491,16 @@ export async function generateNoteQuiz(payload: any): Promise<{ markdown: string
       { type: "text", text: `${promptText}\n\n以下为课程笔记中的关键画面（可结合板书/公式出题）：` },
       ...frames.flatMap((frame) => [
         { type: "text", text: `${frame.timestamp || "关键帧"}${frame.caption ? ` · ${frame.caption}` : ""}` },
-        buildImageBlock(settings.apiProtocol, frame.dataUrl)
+        buildImageBlock(frame.dataUrl)
       ])
     ]
     : promptText;
 
-  const response = await fetch(endpoint, {
-    method: "POST",
+  const { response, result } = await postChatCompletion({
+    endpoint,
     headers,
-    body: JSON.stringify({
+    jsonMode: true,
+    body: {
       model,
       temperature,
       stream: false,
@@ -371,39 +508,102 @@ export async function generateNoteQuiz(payload: any): Promise<{ markdown: string
         {
           role: "system",
           content: [
-            "你是专注课程理解检验的命题导师。请仅根据提供的课程笔记、讲稿与关键画面设计 5 到 8 道高质量单选题。",
-            "重点考察核心原理、因果推导、适用条件与常见误区，干扰项应具教学区分度，不要出机械背诵页码的无效题。",
-            "严格使用以下格式输出，禁止用代码围栏包裹整篇回复：",
-            "### Q1. 题干内容 [MM:SS]",
-            "- A. 选项A",
-            "- B. 选项B",
-            "- C. 选项C",
-            "- D. 选项D",
-            "> 答案：B",
-            "> 解析：解释为什么选 B，以及其余典型错误选项错在哪里。"
+            "你是专注课程理解检验的命题导师。请仅根据提供的课程笔记、讲稿与关键画面设计 4 到 8 道高质量单选题（视内容密度决定，不硬凑数量）。",
+            "重点考察核心原理、因果推导、适用条件与常见误区；严禁在题干中直接给出正确结论再反问（禁止送分题），必须给出 A/B/C/D 四个有教学区分度的同维选项。",
+            "输出严格 JSON（禁止包裹代码围栏），格式：",
+            '{"questions":[{"question":"具体问题表述（不含题号、不含“题干”字样、不自问自答泄露答案）","timestamp":"MM:SS","options":{"A":"选项A","B":"选项B","C":"选项C","D":"选项D"},"answer":"B","explanation":"解释为什么选 B，以及干扰项错因"}]}'
           ].join("\n")
         },
         { role: "user", content: userContent }
       ]
-    })
+    }
   });
-  const result = await response.json().catch(() => null);
   if (!response.ok) throw new Error(result?.error?.message || result?.message || `自测生成请求失败：HTTP ${response.status}`);
-  const rawMarkdown = unwrapOuterCodeFence(extractMessageText(requireCompleteModelChoice(result, "随堂自测生成")));
-  const parsed = parseQuizQuestions(rawMarkdown);
+  const rawText = extractMessageText(requireCompleteModelChoice(result, "随堂自测生成"));
+  const compiledMarkdown = compileQuizResponseToMarkdown(rawText);
+  const parsed = parseQuizQuestions(compiledMarkdown);
   if (!parsed.length) throw new Error("模型生成了内容，但未能解析出有效的随堂自测题目，请重试。");
-  return { markdown: rawMarkdown, count: parsed.length };
+  return { markdown: compiledMarkdown, count: parsed.length };
+}
+
+export async function generateNoteFlashcards(payload: any): Promise<{ markdown: string; count: number }> {
+  const { settings, model, endpoint, headers, temperature } = await resolveChatClient();
+  const noteMarkdown = stripInlineImagesForPrompt(payload.markdown || "");
+  const transcriptText = String(payload.transcript || "").trim();
+  if (!noteMarkdown && !transcriptText) throw new Error("当前没有可供提炼闪卡的笔记或文字稿内容。");
+  const allowImages = Keji.supportsImage(settings.modelCapability);
+  const frames: KeyFrameItem[] = allowImages
+    ? (Array.isArray(payload.frames) ? payload.frames : [])
+      .filter((frame: KeyFrameItem) => /^data:image\/(jpeg|png|webp);base64,/i.test(frame?.dataUrl || ""))
+      .slice(0, 6)
+    : [];
+
+  const cardTask = resolveNoteStructurePrompt("flashcards").task;
+  const promptText = [
+    `课程标题：${payload.title || "课程笔记"}`,
+    `提炼要求：${cardTask}`,
+    transcriptText ? `参考课程文字稿：\n${transcriptText}` : "",
+    noteMarkdown ? `参考课程笔记：\n${noteMarkdown}` : ""
+  ].filter(Boolean).join("\n\n");
+
+  const userContent = frames.length
+    ? [
+      { type: "text", text: `${promptText}\n\n以下为课程笔记中的关键画面（可结合要点提炼闪卡）：` },
+      ...frames.flatMap((frame) => [
+        { type: "text", text: `${frame.timestamp || "关键帧"}${frame.caption ? ` · ${frame.caption}` : ""}` },
+        buildImageBlock(frame.dataUrl)
+      ])
+    ]
+    : promptText;
+
+  const { response, result } = await postChatCompletion({
+    endpoint,
+    headers,
+    jsonMode: true,
+    body: {
+      model,
+      temperature,
+      stream: false,
+      messages: [
+        {
+          role: "system",
+          content: [
+            "你是专注主动回忆训练的课程助手。请仅根据提供的课程笔记、讲稿与关键画面按重点密度提炼 5 到 12 张高质量记忆闪卡（不硬凑重复卡）。",
+            "每张卡片只考察一个核心概念、区别、公式物理含义或关键步骤，正面提问明确，背面答案精炼准确。",
+            "输出严格 JSON（禁止包裹代码围栏），格式：",
+            '{"cards":[{"front":"明确问题","back":"简明准确答案","tags":"主题标签","timestamp":"MM:SS"}]}'
+          ].join("\n")
+        },
+        { role: "user", content: userContent }
+      ]
+    }
+  });
+  if (!response.ok) throw new Error(result?.error?.message || result?.message || `记忆闪卡生成请求失败：HTTP ${response.status}`);
+  const rawText = extractMessageText(requireCompleteModelChoice(result, "记忆闪卡生成"));
+  const compiledMarkdown = compileFlashcardsResponseToMarkdown(rawText);
+  const parsed = parseFlashcards(compiledMarkdown);
+  if (!parsed.length) throw new Error("模型生成了内容，但未能解析出有效的记忆闪卡表格，请重试。");
+  return { markdown: compiledMarkdown, count: parsed.length };
 }
 
 export async function discussNote(payload: any): Promise<
   | { mode: "revise"; summary: string; markdown: string }
   | { mode: "qa" | "feynman"; reply: string }
 > {
+  const task = acquireGenerationSignal(payload.taskId);
+  try { return await runDiscussion(payload, task.signal); }
+  finally { task.release(); }
+}
+
+async function runDiscussion(payload: any, signal?: AbortSignal): ReturnType<typeof discussNote> {
   const { settings, model, endpoint, headers, temperature } = await resolveChatClient();
   const mode: DiscussionMode = payload.mode === "qa" || payload.mode === "feynman" ? payload.mode : "revise";
   const request = String(payload.request || "").trim();
   const markdown = stripInlineImagesForPrompt(payload.markdown || "");
-  if (!request || !markdown) throw new Error("互动内容和当前笔记都不能为空。");
+  const transcriptText = String(payload.transcript || "").trim();
+  if (!request) throw new Error("互动内容不能为空。");
+  if (mode === "revise" && !markdown) throw new Error("当前没有可修订的笔记内容。");
+  if (mode !== "revise" && !markdown && !transcriptText) throw new Error("当前缺少笔记和课程文字稿，无法回答。");
 
   const allowImages = Keji.supportsImage(settings.modelCapability);
   const frames: KeyFrameItem[] = allowImages
@@ -416,15 +616,15 @@ export async function discussNote(payload: any): Promise<
   const interactionLabel = mode === "qa" ? "用户提问" : mode === "feynman" ? "用户费曼复述内容" : "用户修订要求";
   const discussionText = [
     `${interactionLabel}：\n${request}`,
-    payload.transcript ? `\n原始课程文字稿（用于核对事实与时间戳）：\n${String(payload.transcript)}` : "",
-    `\n当前笔记 Markdown：\n${markdown}`
-  ].join("\n");
+    transcriptText ? `\n原始课程文字稿（用于核对事实与时间戳）：\n${transcriptText}` : "",
+    markdown ? `\n当前笔记 Markdown：\n${markdown}` : ""
+  ].filter(Boolean).join("\n");
   const discussionContent = frames.length
     ? [
       { type: "text", text: `${discussionText}\n\n以下为笔记中已选关键帧，按时间戳对应：` },
       ...frames.flatMap((frame) => [
         { type: "text", text: `${frame.timestamp || "关键帧"}${frame.caption ? ` · ${frame.caption}` : ""}` },
-        buildImageBlock(settings.apiProtocol, frame.dataUrl)
+        buildImageBlock(frame.dataUrl)
       ])
     ]
     : discussionText;
@@ -450,17 +650,19 @@ export async function discussNote(payload: any): Promise<
         frameRule
       ]
       : [
-        "你是课程笔记的协作编辑助手。根据用户讨论要求，直接修订当前整篇 Markdown 笔记并保留未要求改动的内容。",
-        "只根据提供的笔记、文字稿和可能附带的关键帧修订；不得补造事实。用户没有要求改变的关键内容、时间戳、章节结构与截图标记应保留。",
+        "你是课程笔记的协作编辑助手。根据用户讨论要求修订当前 Markdown 笔记，保留未要求改动的内容、章节结构、[视频关键帧：...] 占位和关键时间戳。",
+        "只根据提供的笔记、文字稿和可能附带的关键帧修订；不得补造事实。",
         frameRule,
-        "输出必须严格包含两个区块：[[KEJI_CHANGE_SUMMARY]]一两句中文说明改动[[/KEJI_CHANGE_SUMMARY]]，然后 [[KEJI_UPDATED_NOTE]] 和 [[/KEJI_UPDATED_NOTE]] 之间放完整的更新后 Markdown。",
-        "不要把整个答案包在代码围栏中。"
+        "输出严格 JSON（禁止包裹代码围栏），格式：",
+        '{"summary":"一两句中文说明做了哪些修订","updatedMarkdown":"完整修订后的 Markdown 正文"}'
       ];
 
-  const response = await fetch(endpoint, {
-    method: "POST",
+  const { response, result } = await postChatCompletion({
+    endpoint,
     headers,
-    body: JSON.stringify({
+    signal,
+    jsonMode: mode === "revise",
+    body: {
       model,
       temperature,
       stream: false,
@@ -472,9 +674,8 @@ export async function discussNote(payload: any): Promise<
         })),
         { role: "user", content: discussionContent }
       ]
-    })
+    }
   });
-  const result = await response.json().catch(() => null);
   if (!response.ok) throw new Error(result?.error?.message || result?.message || `模型请求失败：HTTP ${response.status}`);
   const opLabel = mode === "qa" ? "课程答疑" : mode === "feynman" ? "费曼复述批改" : "笔记讨论修订";
   const text = extractMessageText(requireCompleteModelChoice(result, opLabel)).trim();
@@ -483,65 +684,79 @@ export async function discussNote(payload: any): Promise<
   if (mode === "qa" || mode === "feynman") {
     return { mode, reply: text };
   }
-  const summary = text.match(/\[\[KEJI_CHANGE_SUMMARY\]\]([\s\S]*?)\[\[\/KEJI_CHANGE_SUMMARY\]\]/)?.[1]?.trim() || "已根据讨论更新笔记。";
-  const updated = text.match(/\[\[KEJI_UPDATED_NOTE\]\]([\s\S]*?)\[\[\/KEJI_UPDATED_NOTE\]\]/)?.[1]?.trim();
-  if (!updated) throw new Error("模型响应缺少完整笔记区块，请重试或换一个兼容模型。");
-  return { mode: "revise", summary, markdown: updated };
+  const revised = parseDiscussionReviseResponse(text);
+  if (!revised) throw new Error("模型响应缺少有效修订结果，请重试或换一个兼容模型。");
+  return { mode: "revise", summary: revised.summary, markdown: revised.markdown };
 }
 
 export async function enrichNoteWithFrames(payload: any): Promise<string> {
   const { settings, model, endpoint, headers } = await resolveChatClient(null, { fallbackTemperature: 0.2 });
   if (!Keji.supportsImage(settings.modelCapability)) throw new Error("当前模型能力不支持图片视觉理解。");
-  const frames: KeyFrameItem[] = Array.isArray(payload.frames) ? payload.frames.slice(0, payload.discoverKeyframes ? 24 : 8) : [];
+  const frames: KeyFrameItem[] = Array.isArray(payload.frames)
+    ? payload.frames.slice(0, payload.discoverKeyframes ? 28 : 32)
+    : [];
   if (!frames.length) throw new Error("没有成功截取可供模型分析的视频关键帧。");
   const transcriptText = String(payload.transcript || "").trim();
   const noteWithoutImages = stripInlineImagesForPrompt(payload.markdown || "");
+  const isDiscover = Boolean(payload.discoverKeyframes);
+
+  const instructionLines = isDiscover
+    ? [
+      "随后给出按内容热点采样的候选视频画面（编号与时间戳顺序对应）。请结合文字稿和当前笔记，评估每帧学习价值并给出 JSON 视觉补充补丁。",
+      "【关键帧数量原则（0..N）】不设固定张数上下限：纯讲师露脸/空白/模糊转场帧一律跳过；同一板书或同页幻灯片只保留最完整清晰的一帧；若整课均无值得配图的板书、电路、公式、图表或界面演示，keyframes 直接输出 []。",
+      "【就地修文原则】只记录图像里清晰可辨的板书公式、参数、图表曲线、代码结果；若发现初稿听错专有名词/寄存器名（如把 GPFCON 误写），写入 replacements 做原文替换；补充细节写入 supplements。",
+      "输出严格 JSON（禁止代码围栏），无需重复输出整篇原笔记：",
+      '{"keyframes":[{"candidateIndex":1,"timestamp":"MM:SS","sectionTitle":"对应笔记章节标题","caption":"简明图注","boardSupplement":"画面中补充的关键公式/参数（无则省略）"}],"replacements":[{"wrong":"误听词","right":"画面准确词"}],"supplements":[{"sectionTitle":"对应章节","detail":"需补充的视觉细节（无则省略）"}]}'
+    ]
+    : [
+      "请结合下列已截取的关键帧（含编号与时间戳）对当前笔记做图文核对：补充板书细节、纠正文图不一致或听错术语；若某张仅为空白/纯人像无信息量画面可标记 keep: false。",
+      "输出严格 JSON（禁止代码围栏），无需重抄整篇原笔记：",
+      '{"frameUpdates":[{"frameIndex":1,"keep":true,"boardSupplement":"画面补充的关键公式/数据（无则省略）"}],"replacements":[{"wrong":"误听词","right":"画面准确词"}],"supplements":[{"sectionTitle":"对应章节","detail":"图文差异补充（无则省略）"}]}'
+    ];
+
   const content: any[] = [{
     type: "text",
     text: [
-      payload.discoverKeyframes
-        ? "随后的图片是按时间从整段视频中抽取的候选画面，不是预先挑好的重点。请先逐张查看候选画面，结合当前笔记与讲解内容，从中选出最有学习价值的 1 到 8 张；然后用选中的画面对笔记做联合校对。候选图片前的编号和时间戳与后续图片顺序对应。"
-        : "请对这份课程笔记做音视频联合校对。当前笔记与讲解内容提供主线，随后的图片是课程视频帧，图片标题包含时间戳与对应讲解重点。",
-      "阅读画面里的板书、幻灯片、终端输出、图表和演示状态，只补充图像中清楚可辨且对理解有帮助的信息，并把它们放进对应章节。纠正与实际画面明显冲突的描述。不要臆测模糊文字，不要把视频播放器 UI 当课程内容。保留原笔记的事实、章节顺序和时间戳。",
-      payload.discoverKeyframes
-        ? "删除笔记中原有的关键帧占位标记。仅对你选中的候选帧，在相关段落后输出 [[KEYFRAME: HH:MM:SS | 该画面对学习的价值]]。时间戳必须逐字使用候选画面给出的时间。最终输出完整修订后的 Markdown。"
-        : "保留原笔记中的截图标记；未被图像支持的内容不要改写。严格输出完整的修订后 Markdown，不要解释处理过程，也不要用代码围栏。",
+      ...instructionLines,
       `视频：${payload.title || "未命名视频"}`,
-      transcriptText ? `课程文字稿：\n${transcriptText}` : "说明：当前课程未附带文字稿（由全模态模型直接理解音轨生成初稿）。",
+      transcriptText ? `课程文字稿：\n${transcriptText}` : "说明：当前课程未附带文字稿。",
       `当前笔记：\n${noteWithoutImages}`,
-      ...frames.map((frame, index) => `候选画面 ${index + 1} · ${frame.timestamp}${frame.caption ? ` · ${frame.caption}` : ""}`)
+      ...frames.map((frame, index) => `${isDiscover ? "候选画面" : "关键帧"} ${index + 1} · ${frame.timestamp}${frame.caption ? ` · ${frame.caption}` : ""}`)
     ].join("\n\n")
   }];
   let imageCount = 0;
   for (let index = 0; index < frames.length; index += 1) {
     const frame = frames[index]!;
     if (!/^data:image\/(jpeg|png|webp);base64,/i.test(frame.dataUrl || "")) continue;
-    content.push({ type: "text", text: `候选画面 ${index + 1} · ${frame.timestamp}` });
-    content.push(buildImageBlock(settings.apiProtocol, frame.dataUrl));
+    content.push({ type: "text", text: `${isDiscover ? "候选画面" : "关键帧"} ${index + 1} · ${frame.timestamp}` });
+    content.push(buildImageBlock(frame.dataUrl));
     imageCount += 1;
   }
   if (!imageCount) throw new Error("关键帧图片格式无效。");
   const { signal, release } = acquireGenerationSignal(payload.generationTaskId);
   try {
-    const response = await fetch(endpoint, {
-      method: "POST",
+    const { response, result } = await postChatCompletion({
+      endpoint,
       headers,
       signal,
-      body: JSON.stringify({
+      timeoutMs: 600_000,
+      jsonMode: true,
+      body: {
         model,
         messages: [
-          { role: "system", content: "你是严谨的多模态课程笔记编辑。结合视频画面与课程文字稿，只添加画面直接支持的信息。" },
+          { role: "system", content: "你是严谨的多模态课程笔记编辑。结合视频画面与课程文字稿，只输出高价值、画面直接支持的 JSON 校对补丁。" },
           { role: "user", content }
         ],
         temperature: Number.isFinite(Number(settings.temperature)) ? Number(settings.temperature) : 0.2,
         stream: false
-      })
+      }
     });
-    const result = await response.json().catch(() => null);
     if (!response.ok) throw new Error(result?.error?.message || result?.message || `多模态模型请求失败：HTTP ${response.status}`);
-    const markdown = extractMessageText(requireCompleteModelChoice(result, "关键帧校对")).trim();
-    if (!markdown) throw new Error("模型没有返回音视频联合校对后的笔记。");
-    return markdown;
+    const rawReply = extractMessageText(requireCompleteModelChoice(result, "关键帧校对")).trim();
+    if (!rawReply) throw new Error("模型没有返回音视频联合校对结果。");
+    return isDiscover
+      ? applyVisualPatchToMarkdown(noteWithoutImages, rawReply, frames)
+      : applyVisualFrameReviewToMarkdown(noteWithoutImages, frames, rawReply);
   } catch (error) {
     if ((error as Error)?.name === "AbortError" || signal?.aborted) throw new CancelledError();
     throw error;
@@ -581,12 +796,12 @@ async function enrichNoteWithVideoTask(payload: any, taskId: string): Promise<st
       duration: Number(payload.duration) || 0
     };
     const videoUrl = String(payload.videoUrl || "");
-    const cachedCombined = settings.apiProtocol === 'mimo' && settings.modelCapability === 'video_audio'
+    const cachedCombined = settings.modelCapability === 'video_audio'
       ? await getCachedMuxedVideo(lessonTarget, { expectedCid: lessonTarget.cid }) : null;
     const cached = cachedCombined && cachedCombined.size <= MAX_INLINE_VIDEO_BYTES
       ? cachedCombined : await getCachedVideo(lessonTarget, { expectedCid: lessonTarget.cid });
     const videoHasAudio = Boolean(cachedCombined && cached === cachedCombined);
-    const providerLabel = settings.apiProtocol === "mimo" ? "小米 MiMo" : "OpenAI 兼容接口";
+    const providerLabel = "OpenAI 兼容接口";
     let videoBlob: Blob;
     let totalBytes = 0;
 
@@ -595,7 +810,6 @@ async function enrichNoteWithVideoTask(payload: any, taskId: string): Promise<st
       totalBytes = cached.size;
       await writeVideoProgress(taskId, {
         stage: "downloading",
-        provider: settings.apiProtocol,
         loadedBytes: totalBytes,
         totalBytes,
         cached: true
@@ -618,7 +832,7 @@ async function enrichNoteWithVideoTask(payload: any, taskId: string): Promise<st
         signal,
         meta: lessonTarget,
         onProgress: (loadedBytes, expectedBytes) => {
-          void writeVideoProgress(taskId, { stage: "downloading", provider: settings.apiProtocol, loadedBytes, totalBytes: expectedBytes });
+          void writeVideoProgress(taskId, { stage: "downloading", loadedBytes, totalBytes: expectedBytes });
         }
       });
       videoBlob = downloaded.file;
@@ -630,32 +844,34 @@ async function enrichNoteWithVideoTask(payload: any, taskId: string): Promise<st
     }
     await writeVideoProgress(taskId, {
       stage: "analyzing",
-      provider: settings.apiProtocol,
       loadedBytes: totalBytes,
       totalBytes
     });
     const base64Video = Keji.bytesToBase64(new Uint8Array(await videoBlob.arrayBuffer()));
     const videoDataUrl = `data:${videoBlob.type || "video/mp4"};base64,${base64Video}`;
-    const videoInput = buildVideoBlock(settings.apiProtocol, videoDataUrl, payload.duration);
+    const videoInput = buildVideoBlock(videoDataUrl);
     const transcriptText = String(payload.transcript || "").trim();
+    const noteWithoutImages = stripInlineImagesForPrompt(payload.markdown || "");
 
-    const response = await fetch(endpoint, {
-      method: "POST",
+    const { response, result } = await postChatCompletion({
+      endpoint,
       headers,
       signal,
-      body: JSON.stringify({
+      timeoutMs: 600_000,
+      jsonMode: false,
+      body: {
         model,
         messages: [
           {
             role: "system",
             content: [
               videoHasAudio
-                ? "你是严谨的音视频课程笔记编辑。当前视频包含画面与伴随音轨，请结合两者修订笔记。"
-                : "你是严谨的音视频课程笔记编辑。你会结合课程讲解内容与当前分 P 的视频画面修订笔记（视频流不含伴随音轨，口述内容来自已有讲解/初稿）。",
-              "结合视频中的幻灯片、板书、终端输出、图表、操作步骤和时间变化修订笔记。补充视觉信息时只写画面中清楚可辨的内容；不要臆测。",
-              "保留已有知识点、例子、步骤、数据和章节结构；修正被视频证据推翻的描述。",
-              "从整段视频中选出 1 到 5 个最值得回看或截图的时刻，在对应章节后输出标记 [[KEYFRAME: HH:MM:SS | 画面与讲解的重点]]；时间戳必须与课程时间线一致，不要按固定间隔取样。",
-              "输出完整 Markdown，不要包在代码围栏中，也不要描述你看不到的内容。"
+                ? "你是严谨的音视频课程笔记编辑。当前视频包含画面与伴随音轨，请结合两者输出 JSON 视觉校对补丁。"
+                : "你是严谨的音视频课程笔记编辑。你会结合课程讲解内容与视频画面输出 JSON 视觉校对补丁（视频流不含伴随音轨）。",
+              "结合视频中的幻灯片、板书、终端输出、电路图或波形补充清楚可辨的信息；若发现听错术语用 replacements 做原文替换，额外细节放 supplements。",
+              "【关键帧规则（0..N）】完全按重点画面出现位置决定数量，不设定机械张数；纯口述无板书重点直接返回 \"keyframes\": []。务必挑选板书/图表/演示内容完整清晰呈现在屏幕上的稳定时刻。",
+              "输出严格 JSON（禁止包裹代码围栏），无需重写原笔记：",
+              '{"keyframes":[{"timestamp":"MM:SS","sectionTitle":"对应笔记章节","caption":"画面重点简述","boardSupplement":"清晰可见的板书/公式补充（无则省略）"}],"replacements":[{"wrong":"误听词","right":"画面准确词"}],"supplements":[{"sectionTitle":"对应章节","detail":"需补充的视觉细节（无则省略）"}]}'
             ].join("\n")
           },
           {
@@ -666,7 +882,7 @@ async function enrichNoteWithVideoTask(payload: any, taskId: string): Promise<st
                 text: [
                   `视频：${payload.title || "未命名视频"}`,
                   transcriptText ? `课程文字稿（含时间戳）：\n${transcriptText}` : "",
-                  `当前分段笔记，请在此基础上结合视频画面完整修订：\n${String(payload.markdown || "")}`
+                  `当前笔记大纲与正文：\n${noteWithoutImages}`
                 ].filter(Boolean).join("\n\n")
               },
               videoInput
@@ -675,16 +891,12 @@ async function enrichNoteWithVideoTask(payload: any, taskId: string): Promise<st
         ],
         temperature,
         stream: false
-      })
+      }
     });
-    const result = await response.json().catch(() => null);
     if (!response.ok) throw new Error(result?.error?.message || result?.message || `整段视频模型请求失败：HTTP ${response.status}`);
-    const markdown = extractMessageText(requireCompleteModelChoice(result, "完整视频笔记校对")).trim();
-    if (!markdown) throw new Error("模型没有返回视频理解后的笔记。");
-    if (!/\[\[KEYFRAME:\s*\d{1,2}:\d{2}(?::\d{2})?\s*\|\s*[^\]]+\]\]/i.test(markdown)) {
-      throw new Error("视频模型没有返回可截图的关键时刻标记；将尝试按候选画面分析。");
-    }
-    return markdown;
+    const rawReply = extractMessageText(requireCompleteModelChoice(result, "完整视频笔记校对")).trim();
+    if (!rawReply) throw new Error("模型没有返回视频理解后的校对结果。");
+    return applyVisualPatchToMarkdown(noteWithoutImages, rawReply);
   } catch (error) {
     if ((error as Error)?.name === "AbortError" || signal?.aborted) throw new CancelledError();
     throw error;

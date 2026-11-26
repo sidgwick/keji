@@ -287,9 +287,20 @@ export async function getCachedTranscription(target: string | VideoTarget, { exp
     segments?: TranscriptSegment[];
     detectedLanguages?: string[];
     manual?: boolean;
+    updatedAt?: number;
   }>(dir, lessonNames(prefix).transcript);
   if (!data || !String(data.text || "").trim() || !cidMatches(data.cid, expectedCid)) return null;
   return data;
+}
+
+export async function listManualTranscriptions() {
+  const { lessons } = await listAllLessonOpfsCaches();
+  const records = [];
+  for (const lessonKey of lessons.keys()) {
+    const record = await getCachedTranscription(lessonKey);
+    if (record?.text && record.manual !== false) records.push({ lessonKey, ...record });
+  }
+  return records;
 }
 
 export async function putCachedTranscription(
@@ -495,7 +506,7 @@ export async function downloadAndCacheVideo(
           ? `${prefixLabel}视频超过当前上限 ${Math.floor(maxBytes / 1024 / 1024)} MB${providerLabel ? "，将改用关键帧分析" : ""}。`
           : "浏览器磁盘缓存不可用，视频超过 150 MB，无法安全读取。");
       }
-      if (writable) await writable.write(value);
+      if (writable) await writable.write(value.slice().buffer);
       else chunks.push(value.slice());
 
       const now = Date.now();
@@ -615,43 +626,15 @@ export async function clearLessonOpfsCache(target: string | VideoTarget): Promis
 
   let freedBytes = 0;
   const toRemove: string[] = [];
+  const cachedTranscript = await getCachedTranscription(target);
+  const keepTranscript = Boolean(cachedTranscript && cachedTranscript.manual !== false);
   for await (const [name, handle] of (dir as FileSystemDirectoryHandle & { entries(): AsyncIterable<[string, FileSystemHandle]> }).entries()) {
     if (handle.kind !== "file" || !name.startsWith(`${prefix}.`)) continue;
+    if (keepTranscript && (name === lessonNames(prefix).transcript || name === lessonNames(prefix).meta)) continue;
     const file = await (handle as FileSystemFileHandle).getFile().catch(() => null);
     if (file) freedBytes += file.size;
     toRemove.push(name);
   }
   for (const name of toRemove) await dir.removeEntry(name).catch(() => {});
-  return { freedBytes };
-}
-
-export async function clearAllLessonOpfsCaches(): Promise<{ freedBytes: number }> {
-  let freedBytes = 0;
-  if (!globalThis.navigator?.storage?.getDirectory) return { freedBytes: 0 };
-  try {
-    const root = await globalThis.navigator.storage.getDirectory() as FileSystemDirectoryHandle & {
-      entries(): AsyncIterable<[string, FileSystemHandle]>;
-    };
-    const dir = await openCacheDir({ create: false }) as (FileSystemDirectoryHandle & {
-      entries(): AsyncIterable<[string, FileSystemHandle]>;
-    }) | null;
-    if (dir) {
-      for await (const [, handle] of dir.entries()) {
-        if (handle.kind !== "file") continue;
-        const file = await (handle as FileSystemFileHandle).getFile().catch(() => null);
-        if (file) freedBytes += file.size;
-      }
-      await root.removeEntry(CACHE_DIR_NAME, { recursive: true }).catch(() => {});
-    }
-    // Also clean any leftover legacy root temporary video captures if present.
-    for await (const [name, handle] of root.entries()) {
-      if (handle.kind !== "file" || !/^keji-(?:video|capture)-.*\.mp4$/i.test(name)) continue;
-      const file = await (handle as FileSystemFileHandle).getFile().catch(() => null);
-      if (file) freedBytes += file.size;
-      await root.removeEntry(name).catch(() => {});
-    }
-  } catch {
-    return { freedBytes };
-  }
   return { freedBytes };
 }

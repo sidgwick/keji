@@ -1,3 +1,4 @@
+import { createSilentTestWav, requestAsr, type AsrEndpointSettings, type AsrResponse } from "../../lib/asr.ts";
 import {
   configureBilibiliCdnRequestHeaders,
   getVideoTab,
@@ -11,28 +12,38 @@ import {
   enrichNoteWithFrames,
   enrichNoteWithVideo,
   generateNote,
+  generateNoteFlashcards,
   generateNoteQuiz,
   hasActiveGenerationTasks,
   normalizeSettings,
+  synthesizeNoteOverview,
   testModelConnection,
 } from "../../lib/background/llm-service.ts";
 import {
-  clearLegacyTranscriptDraftsStore,
   deleteNote,
   findMatchingNotes,
   getAllNotes,
+  getNoteIntermediateOverview,
   getNote,
   listNotes,
+  listRecoveryNotes,
   noteIntermediateBytes,
   saveNote,
   stripIntermediateFromNotes,
   summarizeNote,
   updateFlashcardReviewItem,
   updateNote,
+  updateGenerationNote,
+  updateVisualNote,
+  reviseNoteView,
+  restoreRecoveryNote,
+  updateNoteFlashcardState,
   updateNoteQuizState,
 } from "../../lib/background/notes-db.ts";
 import {
   REMOTE_NOTES_SYNC_ALARM,
+  createLocalNotesBackup,
+  importLocalNotesBackup,
   disableRemoteNotesAutoSync,
   getRemoteNotesSyncState,
   queueRemoteNotesAutoSync,
@@ -40,10 +51,10 @@ import {
   runAutoRemoteNotesSync,
   runRemoteNotesBackupWithSyncState,
 } from "../../lib/background/webdav-sync.ts";
+import { getStored } from "../../lib/storage.ts";
 import { collectFlashcardsFromNotes } from "../../lib/flashcards.ts";
-import { Keji, type TranscriptSegment, type VideoTarget } from "../../lib/keji.ts";
+import { Keji, type KejiSettings, type TranscriptSegment, type VideoTarget } from "../../lib/keji.ts";
 import {
-  clearAllLessonOpfsCaches,
   clearLessonOpfsCache,
   getCachedAudio,
   getLessonCacheStatus,
@@ -114,11 +125,13 @@ export default defineBackground(() => {
         await configureBilibiliCdnRequestHeaders();
         return { ok: true };
       case "GET_SETTINGS": {
-        const { settings } = await chrome.storage.local.get("settings");
+        const settings = await getStored<Partial<KejiSettings>>("settings", {});
         return { ok: true, settings: normalizeSettings(settings) };
       }
       case "TEST_MODEL_CONNECTION":
         return { ok: true, result: await testModelConnection(message.settings) };
+      case "TEST_TRANSCRIPTION_CONNECTION":
+        return { ok: true, result: await testTranscriptionConnection(message.settings) };
       case "SAVE_NOTE": {
         const note = await saveNote(message.note);
         await queueRemoteNotesAutoSync();
@@ -126,6 +139,21 @@ export default defineBackground(() => {
       }
       case "UPDATE_NOTE": {
         const note = await updateNote(message.note);
+        await queueRemoteNotesAutoSync();
+        return { ok: true, note: summarizeNote(note) };
+      }
+      case "REVISE_NOTE_VIEW": {
+        const note = await reviseNoteView(message.input);
+        await queueRemoteNotesAutoSync();
+        return { ok: true, note: summarizeNote(note) };
+      }
+      case "UPDATE_GENERATION_NOTE": {
+        const note = await updateGenerationNote(message.input);
+        await queueRemoteNotesAutoSync();
+        return { ok: true, note: summarizeNote(note) };
+      }
+      case "UPDATE_VISUAL_NOTE": {
+        const note = await updateVisualNote(message.input);
         await queueRemoteNotesAutoSync();
         return { ok: true, note: summarizeNote(note) };
       }
@@ -147,6 +175,13 @@ export default defineBackground(() => {
         return { ok: true, cards: collectFlashcardsFromNotes(await getAllNotes(), { dueOnly: true }) };
       case "GET_ALL_FLASHCARDS":
         return { ok: true, cards: collectFlashcardsFromNotes(await getAllNotes()) };
+      case "GENERATE_NOTE_FLASHCARDS":
+        return { ok: true, result: await generateNoteFlashcards(message.payload) };
+      case "UPDATE_NOTE_FLASHCARDS": {
+        const flashcardState = await updateNoteFlashcardState(message.id, message.flashcardMarkdown, message.flashcardReview);
+        await queueRemoteNotesAutoSync();
+        return { ok: true, ...flashcardState };
+      }
       case "GENERATE_NOTE_QUIZ":
         return { ok: true, result: await generateNoteQuiz(message.payload) };
       case "UPDATE_NOTE_QUIZ": {
@@ -156,6 +191,20 @@ export default defineBackground(() => {
       }
       case "REMOTE_NOTES_BACKUP":
         return { ok: true, result: await runRemoteNotesBackupWithSyncState(message.action) };
+      case "EXPORT_LOCAL_NOTES_BACKUP":
+        return { ok: true, body: await createLocalNotesBackup() };
+      case "IMPORT_LOCAL_NOTES_BACKUP": {
+        const result = await importLocalNotesBackup(message.bytes);
+        await queueRemoteNotesAutoSync();
+        return { ok: true, result };
+      }
+      case "LIST_RECOVERY_NOTES":
+        return { ok: true, notes: await listRecoveryNotes() };
+      case "RESTORE_RECOVERY_NOTE": {
+        const note = await restoreRecoveryNote(message.id);
+        await queueRemoteNotesAutoSync();
+        return { ok: true, note: summarizeNote(note) };
+      }
       case "QUEUE_REMOTE_NOTES_SYNC":
         await queueRemoteNotesAutoSync();
         return { ok: true };
@@ -183,6 +232,8 @@ export default defineBackground(() => {
             return encoded.wavBase64;
           })
         };
+      case "SYNTHESIZE_NOTE_OVERVIEW":
+        return { ok: true, ...await synthesizeNoteOverview(message.payload) };
       case "CANCEL_GENERATION":
         cancelGenerationTask(message.taskId);
         return { ok: true };
@@ -214,14 +265,14 @@ export default defineBackground(() => {
           }
         }
         {
-          const { transcription = null } = await chrome.storage.local.get("transcription");
+          const transcription = await getStored<Record<string, any> | null>("transcription", null);
           if (transcription) {
             await chrome.storage.local.set({ transcription: { ...transcription, status: "cancelled", error: "已停止转写。" } });
           }
         }
         return { ok: true };
       case "GET_TRANSCRIPTION": {
-        const { transcription = null } = await chrome.storage.local.get("transcription");
+        const transcription = await getStored<Record<string, any> | null>("transcription", null);
         if (transcription && ["starting", "downloading", "transcribing"].includes(transcription.status)
             && !await hasOffscreenDocument()) {
           transcription.status = "error";
@@ -253,44 +304,59 @@ export default defineBackground(() => {
     });
   }
 
-  async function getTranscriptionSettings() {
-    const { settings: storedSettings } = await chrome.storage.local.get("settings");
-    const settings = normalizeSettings(storedSettings);
-    const baseUrl = String(settings.baseUrl || "").trim().replace(/\/+$/, "");
+  async function resolveValidatedAsrSettings(source?: Partial<KejiSettings> | null): Promise<AsrEndpointSettings> {
+    const settings = normalizeSettings(source);
     const configuredEndpoint = String(settings.transcriptionEndpoint || "").trim();
-    const endpoints = configuredEndpoint
-      ? configuredEndpoint.split(/\r?\n/).map((value) => value.trim()).filter(Boolean)
-      : baseUrl ? [`${baseUrl}/audio/transcriptions`] : [];
-    if (endpoints.length > 4) throw new Error("最多配置 4 个语音识别 API 地址。");
-    const endpoint = endpoints[0] || "";
-    const model = String(settings.transcriptionModel || "whisper-1").trim();
-    const transcriptionLanguage = String(settings.transcriptionLanguage || "").trim().toLowerCase();
-    if (transcriptionLanguage && !/^[a-z]{2}$/.test(transcriptionLanguage)) {
-      throw new Error("转写语言请填写两字母语言代码（例如 zh、en、ja），留空则自动检测。");
-    }
+    if (/[\r\n]/.test(configuredEndpoint)) throw new Error("转写服务地址仅允许配置 1 个地址，请在设置页修改。");
+    const endpoint = Keji.resolveAsrEndpoint(configuredEndpoint);
+    const model = String(settings.transcriptionModel || Keji.defaultSettings.transcriptionModel).trim();
     const apiKey = String(settings.transcriptionApiKey || "").trim();
-    if (!endpoint || !model) throw new Error("请先在设置页填写语音识别 API 地址和模型。");
-    const endpointOrigins = new Set<string>();
-    for (const value of endpoints) {
-      let endpointUrl: URL;
-      try { endpointUrl = new URL(value); } catch { throw new Error(`语音识别 API 地址格式不正确：${value}`); }
-      if (!/^https?:$/.test(endpointUrl.protocol)) throw new Error("语音识别 API 地址必须使用 HTTP 或 HTTPS。");
-      endpointOrigins.add(endpointUrl.origin);
-    }
-    for (const origin of endpointOrigins) {
-      if (!await chrome.permissions.contains({ origins: [`${origin}/*`] })) {
-        throw new Error(`扩展还没有语音识别 API 域名权限：${origin}。请在设置中保存并授权。`);
-      }
+    if (!endpoint || !model) throw new Error("请先在设置页填写转写服务地址和模型。");
+    let endpointUrl: URL;
+    try { endpointUrl = new URL(endpoint); } catch { throw new Error(`转写服务地址格式不正确：${endpoint}`); }
+    if (!/^https?:$/.test(endpointUrl.protocol)) throw new Error("转写服务地址必须使用 HTTP 或 HTTPS。");
+    if (!await chrome.permissions.contains({ origins: [`${endpointUrl.origin}/*`] })) {
+      throw new Error(`扩展还没有转写服务域名权限：${endpointUrl.origin}。请在设置中保存并授权。`);
     }
     return {
       endpoint,
-      endpoints,
       model,
       apiKey,
-      language: transcriptionLanguage,
-      prompt: String(settings.transcriptionPrompt || "").trim().slice(0, 200),
-      transcriptionConcurrency: Number(settings.transcriptionConcurrency) || 0
+      prompt: Keji.normalizeTranscriptionPrompt(settings.transcriptionPrompt)
     };
+  }
+
+  async function getTranscriptionSettings() {
+    const storedSettings = await getStored<Partial<KejiSettings>>("settings", {});
+    return resolveValidatedAsrSettings(storedSettings);
+  }
+
+  async function testTranscriptionConnection(input: Partial<KejiSettings> | null | undefined) {
+    const settings = await resolveValidatedAsrSettings(input);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 45000);
+    const startedAt = Date.now();
+    try {
+      const result: AsrResponse = await requestAsr(createSilentTestWav(), settings, controller.signal, { maxTokens: 64 });
+      return {
+        model: settings.model,
+        endpoint: settings.endpoint,
+        protocol: result.protocol,
+        elapsedMs: Date.now() - startedAt,
+        response: result.text.slice(0, 120),
+        language: result.language
+      };
+    } catch (error) {
+      if ((error as Error)?.name === "AbortError") {
+        throw new Error("语音模型连接测试超时（45 秒）。若本机 Ollama 正在首次加载模型，请稍后重试。");
+      }
+      if (error instanceof TypeError) {
+        throw new Error("无法连接转写服务。请检查地址、本机 Ollama 是否已启动、域名权限和跨域配置。");
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 
   async function prepareLessonAudioForNote(tabId?: number, lessonHint: VideoTarget | null = null) {
@@ -335,7 +401,7 @@ export default defineBackground(() => {
   async function releaseLessonAudio(): Promise<void> {
     if (!await hasOffscreenDocument()) return;
     await chrome.runtime.sendMessage({ target: "offscreen", type: "RELEASE_LESSON_AUDIO" }).catch(() => {});
-    const { transcription = null } = await chrome.storage.local.get("transcription");
+    const transcription = await getStored<Record<string, any> | null>("transcription", null);
     const activeTranscription = Boolean(
       transcription && ["starting", "downloading", "transcribing"].includes(transcription.status)
     );
@@ -392,14 +458,10 @@ export default defineBackground(() => {
   async function retranscribeAudioRange(message: any) {
     const start = Number(message.start);
     const end = Number(message.end);
-    if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end <= start || end - start > 180) {
-      throw new Error("片段时间范围无效；单次重识别最多支持 3 分钟音频。");
+    if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end <= start || end - start > 60) {
+      throw new Error("片段时间范围无效；单次重识别最多支持 60 秒音频。");
     }
     const settings = await getTranscriptionSettings();
-    settings.language = String(message.language || "").trim().toLowerCase();
-    if (settings.language && !/^[a-z]{2}$/.test(settings.language)) {
-      throw new Error("转写语言请填写两字母代码，例如 zh、en 或 ja。");
-    }
 
     const lessonTarget: VideoTarget = { bvid: message.bvid, page: message.page, url: message.url };
     const cachedAudio = await getCachedAudio(lessonTarget);
@@ -422,8 +484,8 @@ export default defineBackground(() => {
       }
       await configureBilibiliCdnRequestHeaders(new URL(tab.url).origin);
       videoUrl = tab.url;
-      bvid = videoInfo.video.bvid;
-      page = videoInfo.video.page;
+      bvid = videoInfo.video.bvid || '';
+      page = videoInfo.video.page || 1;
     }
 
     await ensureOffscreenDocument();
@@ -448,7 +510,7 @@ export default defineBackground(() => {
   }
 
   async function applyTranscriptionUpdate(message: any) {
-    const { transcription = {} } = await chrome.storage.local.get("transcription");
+    const transcription = await getStored<Record<string, any>>("transcription", {});
     if (transcription.taskId && transcription.taskId !== message.taskId) {
       return { ok: true, ignored: true };
     }
@@ -539,16 +601,16 @@ export default defineBackground(() => {
   }
 
   async function getAllCacheOverview() {
-    const [opfs, notes] = await Promise.all([listAllLessonOpfsCaches(), getAllNotes()]);
+    const [opfs, notes] = await Promise.all([listAllLessonOpfsCaches(), getNoteIntermediateOverview()]);
     const lessonSet = new Set<string>();
     for (const [key, entry] of opfs.lessons) {
       if (entry.opfsBytes > 0) lessonSet.add(key);
     }
     let noteIntermediate = 0;
     for (const note of notes) {
-      const size = noteIntermediateBytes(note);
+      const size = note.bytes;
       noteIntermediate += size;
-      if (size > 0) lessonSet.add(Keji.lessonKey(note) || note.id);
+      if (size > 0) lessonSet.add(note.lessonKey);
     }
     const transcriptBytes = opfs.transcriptBytes + opfs.metaBytes + noteIntermediate;
     return {
@@ -566,7 +628,7 @@ export default defineBackground(() => {
     if (hasActiveGenerationTasks()) {
       throw new Error("当前有笔记生成任务正在运行，请先停止生成后再清理缓存。");
     }
-    const { transcription = null } = await chrome.storage.local.get("transcription");
+    const transcription = await getStored<Record<string, any> | null>("transcription", null);
     if (transcription && ["starting", "downloading", "transcribing"].includes(transcription.status)
         && await hasOffscreenDocument()) {
       const taskKey = Keji.lessonKey(transcription);
@@ -582,9 +644,13 @@ export default defineBackground(() => {
     const matchingNotes = await findMatchingNotes({ lessonKey, noteId });
     if (!lessonKey && matchingNotes.length) lessonKey = Keji.lessonKey(matchingNotes[0]!);
 
+    if (!lessonKey || !navigator.locks) throw new Error('无法安全清理当前课节缓存。');
+    return navigator.locks.request(`keji-lesson-${lessonKey}`, { ifAvailable: true }, async (lock) => {
+      if (!lock) throw new Error('本节正在另一工作区处理，请稍后清理缓存。');
+
     await assertNotActiveForCacheCleanup(lessonKey);
     if (matchingNotes.some((note) => note.generationStatus === "running")) {
-      const { transcription = null } = await chrome.storage.local.get("transcription");
+      const transcription = await getStored<Record<string, any> | null>("transcription", null);
       if (hasActiveGenerationTasks() || (transcription && ["starting", "downloading", "transcribing"].includes(transcription.status))) {
         throw new Error("本节笔记正在生成中，请先停止后再清理缓存。");
       }
@@ -594,7 +660,7 @@ export default defineBackground(() => {
     if (lessonKey) {
       const opfsCleared = await clearLessonOpfsCache(lessonKey);
       freedBytes += opfsCleared.freedBytes;
-      const { transcription = null } = await chrome.storage.local.get("transcription");
+      const transcription = await getStored<Record<string, any> | null>("transcription", null);
       if (transcription && Keji.lessonKey(transcription) === lessonKey) {
         await chrome.storage.local.remove("transcription");
       }
@@ -603,15 +669,24 @@ export default defineBackground(() => {
 
     const stripped = await stripIntermediateFromNotes(matchingNotes, false);
     return { freedBytes: freedBytes + stripped.freedBytes };
+    });
   }
 
   async function clearAllProcessCaches() {
     await assertNotActiveForCacheCleanup();
-    const opfsCleared = await clearAllLessonOpfsCaches();
-    await clearLegacyTranscriptDraftsStore();
+    if (!navigator.locks) throw new Error('当前浏览器无法安全清理缓存。');
+    const { lessons } = await listAllLessonOpfsCaches();
+    let freedBytes = 0;
+    let skippedLessons = 0;
+    for (const lessonKey of lessons.keys()) {
+      const result = await navigator.locks.request(`keji-lesson-${lessonKey}`, { ifAvailable: true }, async (lock) =>
+        lock ? (await clearLessonOpfsCache(lessonKey)).freedBytes : null);
+      if (result === null) skippedLessons += 1;
+      else freedBytes += result;
+    }
     await chrome.storage.local.remove("transcription");
     await releaseLessonAudio().catch(() => {});
     const stripped = await stripIntermediateFromNotes(await getAllNotes(), true);
-    return { freedBytes: opfsCleared.freedBytes + stripped.freedBytes, cleanedNotes: stripped.cleanedNotes };
+    return { freedBytes: freedBytes + stripped.freedBytes, cleanedNotes: stripped.cleanedNotes, skippedLessons };
   }
 });

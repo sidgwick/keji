@@ -4,11 +4,10 @@ import { getCachedTranscription, putCachedTranscription } from '../lesson-cache.
 import {
   normalizeTranscriptFile,
   resolveSelectedTranscriptTimeRange,
-  summarizeTranscriptionLanguageRanges,
   transcriptToSrt,
 } from '../subtitles.ts';
 import { workspace } from './state.svelte.ts';
-import { callBackground, downloadText, showNotice, withButtonBusy } from './ui.ts';
+import { callBackground, downloadText, showNotice } from './ui.ts';
 
 interface TranscriptionHostHooks {
   getCurrentVideo: () => VideoTarget | null;
@@ -23,12 +22,22 @@ interface TranscriptionHostHooks {
 
 export const transcriptionState = $state({
   running: false,
+  starting: false,
+  stopping: false,
+  retranscribingSelection: false,
+  phaseLabel: '',
   progress: '',
+  progressPercent: null as number | null,
+  outcome: 'idle' as 'idle' | 'running' | 'done' | 'cancelled' | 'error',
   progressVisible: false,
-  retranscribeLanguage: '',
   conflict: { visible: false, copy: '', title: '', text: '' },
   previewOpen: false,
 });
+
+export function dismissTranscriptionProgress(): void {
+  if (transcriptionState.running) return;
+  transcriptionState.progressVisible = false;
+}
 
 let autoTranscriptionText = '';
 let transcriptManuallyEdited = false;
@@ -81,7 +90,7 @@ function renderTranscriptionConflict(transcription = latestTranscription): void 
     return;
   }
   const partLabel = `第 ${transcription.page || currentVideo?.page}/${currentVideo?.pageCount || 1} 节`;
-  const partName = transcription.part || currentVideo?.part || '当前分 P';
+  const partName = transcription.part || currentVideo?.part || '本节';
   transcriptionState.conflict = {
     visible: Boolean(unresolved),
     copy: `本次识别稿来自${partLabel} · ${partName}。编辑区保留着另一份内容，课记没有自动覆盖。`,
@@ -96,19 +105,25 @@ function saveCurrentTranscriptToCache(delay = 500, manual = true): void {
   const video = host.getCurrentVideo();
   const text = workspace.transcript.trim();
   if (!video || !text) return;
+  const videoSnapshot = { ...video };
+  const segmentsSnapshot = [...latestTranscriptionSegments];
+  const langsSnapshot = [...latestDetectedLanguages];
+  const expectedLessonKey = Keji.lessonKey(videoSnapshot);
   const write = () => {
     transcriptCacheSaveTimer = null;
-    void putCachedTranscription(video, {
-      cid: Number(video.cid) || 0,
-      title: video.title || '',
-      part: video.part || '',
-      duration: Number(video.duration) || 0,
+    void putCachedTranscription(videoSnapshot, {
+      cid: Number(videoSnapshot.cid) || 0,
+      title: videoSnapshot.title || '',
+      part: videoSnapshot.part || '',
+      duration: Number(videoSnapshot.duration) || 0,
       text,
-      segments: latestTranscriptionSegments,
-      detectedLanguages: latestDetectedLanguages,
+      segments: segmentsSnapshot,
+      detectedLanguages: langsSnapshot,
       manual
     }).then(() => {
-      host.onCacheUpdated(video);
+      if (Keji.lessonKey(host.getCurrentVideo()) === expectedLessonKey) {
+        host.onCacheUpdated(videoSnapshot);
+      }
     }).catch(() => {});
   };
   if (delay <= 0) write();
@@ -127,6 +142,7 @@ export function clearPendingTranscriptCacheTimer(): void {
 }
 
 export function resetTranscriptionForNewVideo(clearTranscriptAndConflict = true): void {
+  clearPendingTranscriptCacheTimer();
   autoTranscriptionText = '';
   transcriptManuallyEdited = false;
   latestTranscriptionSegments = [];
@@ -136,6 +152,15 @@ export function resetTranscriptionForNewVideo(clearTranscriptAndConflict = true)
     workspace.transcriptExpanded = false;
     latestTranscription = null;
     resolvedTranscriptionId = '';
+    transcriptionState.running = false;
+    transcriptionState.starting = false;
+    transcriptionState.stopping = false;
+    transcriptionState.retranscribingSelection = false;
+    transcriptionState.phaseLabel = '';
+    transcriptionState.progress = '';
+    transcriptionState.progressPercent = null;
+    transcriptionState.outcome = 'idle';
+    transcriptionState.progressVisible = false;
     transcriptionState.conflict = { visible: false, copy: '', title: '', text: '' };
     transcriptionState.previewOpen = false;
   }
@@ -163,21 +188,27 @@ export function setSavedNoteTranscriptionState(note: {
   if (!latestDetectedLanguages.length && Array.isArray(note.cachedFallback?.detectedLanguages)) {
     latestDetectedLanguages = note.cachedFallback.detectedLanguages;
   }
-  const savedLanguageRanges = summarizeTranscriptionLanguageRanges(latestTranscriptionSegments);
-  if (savedLanguageRanges.length || latestDetectedLanguages.length) {
+  if (latestDetectedLanguages.length) {
     transcriptionState.progressVisible = true;
-    const languageText = savedLanguageRanges.length
-      ? `分段语言：${savedLanguageRanges.join('；')}`
-      : `检测语言：${latestDetectedLanguages.join('、')}`;
-    transcriptionState.progress = `已保存的转写语言信息：${languageText}。`;
+    transcriptionState.outcome = 'done';
+    transcriptionState.phaseLabel = '已保存语言信息';
+    transcriptionState.progressPercent = null;
+    transcriptionState.progress = `已保存的转写检测语言：${latestDetectedLanguages.join('、')}。`;
   }
 }
 
-export function clearTranscriptProcessMetadata(): void {
+export function clearTranscriptProcessMetadata(clearCreateTranscript = false): void {
   latestTranscriptionSegments = [];
   latestDetectedLanguages = [];
-  if (workspace.activeView === 'note') {
+  if (clearCreateTranscript) {
     workspace.transcript = '';
+    workspace.transcriptExpanded = false;
+    workspace.characterCount = 0;
+    workspace.hasCaptions = false;
+    workspace.captionStatus = '已清理本节媒体缓存；可点击「重新读取」恢复字幕。';
+    transcriptionState.phaseLabel = '';
+    transcriptionState.progressPercent = null;
+    transcriptionState.outcome = 'idle';
     transcriptionState.progressVisible = false;
     transcriptionState.progress = '';
   }
@@ -211,42 +242,80 @@ export function handleTranscriptionStorageChange(transcription: any): void {
   }
   const running = ['starting', 'downloading', 'transcribing'].includes(transcription.status);
   transcriptionState.running = running;
+  if (running) transcriptionState.starting = false;
+  else transcriptionState.stopping = false;
   transcriptionState.progressVisible = Boolean(transcription.status);
 
-  if (transcription.status === 'error' || transcription.status === 'cancelled') {
-    transcriptionState.progress = transcription.status === 'cancelled'
-      ? '已停止转写。'
-      : `转写失败：${transcription.error || '未知错误'}${transcription.text ? '；已保留前面识别到的文字。' : ''}`;
+  if (!transcription.status) {
+    transcriptionState.outcome = 'idle';
+    transcriptionState.phaseLabel = '';
+    transcriptionState.progressPercent = null;
+    transcriptionState.progress = '';
+  } else if (transcription.status === 'cancelled') {
+    transcriptionState.outcome = 'cancelled';
+    transcriptionState.phaseLabel = '已停止转写';
+    transcriptionState.progressPercent = null;
+    transcriptionState.progress = transcription.text
+      ? '已停止转写，已保留前面识别到的文字'
+      : '已停止转写';
+  } else if (transcription.status === 'error') {
+    transcriptionState.outcome = 'error';
+    transcriptionState.phaseLabel = '转写失败';
+    transcriptionState.progressPercent = null;
+    transcriptionState.progress = `${transcription.error || '未知错误'}${transcription.text ? '（已保留前面识别到的文字）' : ''}`;
   } else if (transcription.status === 'downloading') {
     const loaded = Number(transcription.downloadBytes) || 0;
     const total = Number(transcription.downloadTotal) || 0;
-    const progress = total > 0 ? ` ${Math.min(100, Math.floor(loaded / total * 100))}%` : '';
-    transcriptionState.progress = `正在直接获取 B 站音轨${progress}，无需播放视频。`;
+    const pct = total > 0 ? Math.min(100, Math.floor((loaded / total) * 100)) : null;
+    transcriptionState.outcome = 'running';
+    transcriptionState.phaseLabel = '下载音轨';
+    transcriptionState.progressPercent = pct;
+    transcriptionState.progress = pct !== null
+      ? '正在获取 B 站音轨，无需播放视频'
+      : '正在直接获取 B 站音轨，无需播放视频';
   } else if (transcription.status === 'transcribing') {
+    transcriptionState.outcome = 'running';
     if (transcription.phase === 'decode') {
       const mb = (Number(transcription.downloadedBytes || 0) / 1024 / 1024).toFixed(1);
+      transcriptionState.phaseLabel = '解码切分';
+      transcriptionState.progressPercent = null;
       transcriptionState.progress = transcription.fromCache
-        ? `正在读取本机缓存音轨（${mb} MB），准备解码并切分音频。`
-        : `音轨已获取（${mb} MB），正在解码并切分音频。`;
+        ? `已读取本机缓存音轨（${mb} MB），正在解码切分`
+        : `音轨已获取（${mb} MB），正在解码切分`;
     } else if (transcription.chunksTotal > 1) {
-      transcriptionState.progress = `正在识别音频分段：${transcription.chunksDone || 0}/${transcription.chunksTotal}。`;
+      const done = Number(transcription.chunksDone) || 0;
+      const total = Number(transcription.chunksTotal) || 1;
+      transcriptionState.phaseLabel = '语音识别中';
+      transcriptionState.progressPercent = Math.min(100, Math.round((done / total) * 100));
+      transcriptionState.progress = `已完成 ${done} / ${total} 个音频分段`;
     } else {
-      transcriptionState.progress = '音轨已获取，正在发送给语音识别服务。';
+      transcriptionState.phaseLabel = '语音识别中';
+      transcriptionState.progressPercent = null;
+      transcriptionState.progress = '已获取音轨，正在发送至语音识别服务…';
     }
   } else if (transcription.status === 'starting') {
-    transcriptionState.progress = transcription.fromCache ? '正在读取本机缓存音轨…' : '正在准备当前分 P 的音轨…';
+    transcriptionState.outcome = 'running';
+    transcriptionState.phaseLabel = '准备音轨';
+    transcriptionState.progressPercent = null;
+    transcriptionState.progress = transcription.fromCache
+      ? '正在读取本机缓存音轨…'
+      : '正在准备本节音轨…';
   }
-  if (transcription.status === 'done' && transcription.text) {
-    const languageRanges = summarizeTranscriptionLanguageRanges(transcription.segments);
-    const languageSummary = languageRanges.length
-      ? `，分段语言：${languageRanges.join('；')}`
-      : transcription.detectedLanguages?.length
+  if (transcription.status === 'done') {
+    transcriptionState.outcome = 'done';
+    transcriptionState.phaseLabel = '转写完成';
+    transcriptionState.progressPercent = 100;
+    if (transcription.text) {
+      const languageSummary = transcription.detectedLanguages?.length
         ? `，检测语言：${transcription.detectedLanguages.join('、')}`
         : '';
-    const segmentCount = Number(transcription.segments?.length) || 0;
-    const characterCount = String(transcription.text || '').length;
-    transcriptionState.progress = `转写完成：${segmentCount.toLocaleString('zh-CN')} 个片段，${characterCount.toLocaleString('zh-CN')} 字${languageSummary}。`;
-    host.onCacheUpdated(host.getCurrentVideo() || host.getLatestVideo());
+      const segmentCount = Number(transcription.segments?.length) || 0;
+      const characterCount = String(transcription.text || '').length;
+      transcriptionState.progress = `已识别 ${segmentCount.toLocaleString('zh-CN')} 个片段 · ${characterCount.toLocaleString('zh-CN')} 字${languageSummary}`;
+      host.onCacheUpdated(host.getCurrentVideo() || host.getLatestVideo());
+    } else {
+      transcriptionState.progress = '转写已完成，但未识别到有效语音内容。';
+    }
   }
   renderTranscriptionConflict(transcription);
 }
@@ -266,7 +335,7 @@ export async function restoreCachedLessonTranscript(forceCaptions: boolean): Pro
     autoTranscriptionText = cachedTranscript.manual ? '' : cachedTranscript.text;
     latestTranscriptionSegments = Array.isArray(cachedTranscript.segments) ? cachedTranscript.segments : [];
     latestDetectedLanguages = Array.isArray(cachedTranscript.detectedLanguages) ? cachedTranscript.detectedLanguages : [];
-    workspace.captionStatus = cachedTranscript.manual ? '已载入本机缓存的文字稿编辑稿。' : '已载入本机缓存的音轨转写稿。';
+    workspace.captionStatus = cachedTranscript.manual ? '已载入本机缓存的文字稿。' : '已载入本机缓存的语音转写稿。';
     host.onTranscriptChanged();
   }
 }
@@ -274,6 +343,10 @@ export async function restoreCachedLessonTranscript(forceCaptions: boolean): Pro
 export function viewTranscriptionResult(): void {
   const transcription = latestTranscription;
   if (!isSameVideo(transcription) || !transcription?.text) return;
+  if (transcriptionState.previewOpen) {
+    transcriptionState.previewOpen = false;
+    return;
+  }
   transcriptionState.conflict.text = transcription.text;
   transcriptionState.previewOpen = true;
 }
@@ -311,64 +384,68 @@ export function onTranscriptBlur(): void {
   saveCurrentTranscriptToCache(0);
 }
 
-export async function startDirectTranscription(button?: HTMLButtonElement | null): Promise<void> {
+export async function startDirectTranscription(): Promise<void> {
+  if (transcriptionState.starting || transcriptionState.running) return;
   if (!workspace.transcript.trim()) {
     autoTranscriptionText = '';
     transcriptManuallyEdited = false;
   }
-  await withButtonBusy(
-    button,
-    workspace.currentLessonHasCachedAudio ? '正在读取缓存音轨…' : '正在获取音轨…',
-    async () => {
-      await host.requestAudioPermissions('需要允许课记访问 B 站音频服务器，才能直接获取音轨。');
-      const targetVideo = host.getCurrentVideo() || host.getLatestVideo();
-      const lesson = targetVideo
-        ? {
-          bvid: targetVideo.bvid || Keji.bvidFromUrl(targetVideo.url),
-          page: Number(targetVideo.page) || 1,
-          cid: Number(targetVideo.cid) || 0,
-          title: targetVideo.title || '',
-          part: targetVideo.part || '',
-          url: targetVideo.url || '',
-          duration: Number(targetVideo.duration) || 0
-        }
-        : null;
-      const result = await callBackground('START_DIRECT_AUDIO_TRANSCRIPTION', {
-        tabId: host.getCurrentTabId(),
-        lesson
-      });
-      if (!result?.ok) throw new Error(result?.error || '启动快速音轨转写失败。');
-      handleTranscriptionStorageChange(result.transcription);
-      showNotice(
-        result.transcription?.fromCache
-          ? '已命中本机缓存音轨，正在开始转写。'
-          : '已开始下载当前分 P 音轨，视频不需要播放。',
-        'success'
-      );
-    },
-    '启动快速音轨转写失败。'
-  );
+  transcriptionState.starting = true;
+  try {
+    await host.requestAudioPermissions('需要允许课记访问 B 站音频服务器，才能直接获取音轨。');
+    const targetVideo = host.getCurrentVideo() || host.getLatestVideo();
+    const lesson = targetVideo
+      ? {
+        bvid: targetVideo.bvid || Keji.bvidFromUrl(targetVideo.url),
+        page: Number(targetVideo.page) || 1,
+        cid: Number(targetVideo.cid) || 0,
+        title: targetVideo.title || '',
+        part: targetVideo.part || '',
+        url: targetVideo.url || '',
+        duration: Number(targetVideo.duration) || 0
+      }
+      : null;
+    const result = await callBackground('START_DIRECT_AUDIO_TRANSCRIPTION', {
+      tabId: host.getCurrentTabId(),
+      lesson
+    });
+    if (!result?.ok) throw new Error(result?.error || '启动快速音轨转写失败。');
+    handleTranscriptionStorageChange(result.transcription);
+    showNotice(
+      result.transcription?.fromCache
+        ? '已命中本机缓存音轨，正在开始转写。'
+        : '已开始下载本节音轨，无需播放视频。',
+      'success'
+    );
+  } catch (error) {
+    showNotice((error as Error).message || '启动快速音轨转写失败。', 'error');
+  } finally {
+    transcriptionState.starting = false;
+  }
 }
 
-export async function stopTranscription(button?: HTMLButtonElement | null): Promise<void> {
-  await withButtonBusy(
-    button,
-    null,
-    async () => {
-      const result = await callBackground('STOP_AUDIO_TRANSCRIPTION');
-      if (!result?.ok) throw new Error(result?.error || '停止失败。');
-      transcriptionState.progressVisible = true;
-      transcriptionState.progress = '正在识别最后一段音频…';
-    },
-    '停止失败。'
-  );
+export async function stopTranscription(): Promise<void> {
+  if (transcriptionState.stopping) return;
+  transcriptionState.stopping = true;
+  try {
+    const result = await callBackground('STOP_AUDIO_TRANSCRIPTION');
+    if (!result?.ok) throw new Error(result?.error || '停止失败。');
+    transcriptionState.progressVisible = true;
+    transcriptionState.phaseLabel = '正在停止';
+    transcriptionState.progressPercent = null;
+    transcriptionState.progress = '正在识别最后一段音频…';
+  } catch (error) {
+    transcriptionState.stopping = false;
+    showNotice((error as Error).message || '停止失败。', 'error');
+  } finally {
+    if (!transcriptionState.running) transcriptionState.stopping = false;
+  }
 }
 
 export async function retranscribeSelectedTranscript(
-  textarea?: HTMLTextAreaElement | null,
-  button?: HTMLButtonElement | null
+  textarea?: HTMLTextAreaElement | null
 ): Promise<void> {
-  if (!textarea) return;
+  if (!textarea || transcriptionState.retranscribingSelection) return;
   const transcript = workspace.transcript;
   let range;
   try {
@@ -381,46 +458,44 @@ export async function retranscribeSelectedTranscript(
   } catch (error) {
     return showNotice((error as Error).message, 'error');
   }
-  const languageCode = String(transcriptionState.retranscribeLanguage || '').trim().toLowerCase();
 
-  await withButtonBusy(
-    button,
-    '正在重新识别…',
-    async () => {
-      await host.requestAudioPermissions('需要允许课记访问 B 站音频服务器，才能重新识别片段。');
-      const targetVideo = host.getCurrentVideo() || host.getLatestVideo();
-      const result = await callBackground('RETRANSCRIBE_AUDIO_RANGE', {
-        tabId: host.getCurrentTabId(),
-        bvid: targetVideo?.bvid || Keji.bvidFromUrl(targetVideo?.url),
-        page: targetVideo?.page,
-        url: targetVideo?.url || '',
-        start: range.start,
-        end: range.end,
-        language: languageCode
-      });
-      if (!result?.ok) throw new Error(result?.error || '重新识别失败。');
-      host.onCacheUpdated(targetVideo);
-      const segments: TranscriptSegment[] = result.segments || [];
-      const replacement = segments.map((segment) => `[${Keji.formatTime(segment.time)}] ${segment.text}`).join('\n');
-      if (!replacement.trim()) throw new Error('语音识别接口没有返回文字。');
+  transcriptionState.retranscribingSelection = true;
+  try {
+    await host.requestAudioPermissions('需要允许课记访问 B 站音频服务器，才能重新识别片段。');
+    const targetVideo = host.getCurrentVideo() || host.getLatestVideo();
+    const result = await callBackground('RETRANSCRIBE_AUDIO_RANGE', {
+      tabId: host.getCurrentTabId(),
+      bvid: targetVideo?.bvid || Keji.bvidFromUrl(targetVideo?.url),
+      page: targetVideo?.page,
+      url: targetVideo?.url || '',
+      start: range.start,
+      end: range.end
+    });
+    if (!result?.ok) throw new Error(result?.error || '重新识别失败。');
+    host.onCacheUpdated(targetVideo);
+    const segments: TranscriptSegment[] = result.segments || [];
+    const replacement = segments.map((segment) => `[${Keji.formatTime(segment.time)}] ${segment.text}`).join('\n');
+    if (!replacement.trim()) throw new Error('语音识别接口没有返回文字。');
 
-      textarea.setRangeText(`${replacement}${range.suffix}`, range.replaceStart, range.replaceEnd, 'select');
-      workspace.transcript = textarea.value;
-      transcriptManuallyEdited = true;
-      autoTranscriptionText = '';
-      latestTranscriptionSegments = [
-        ...latestTranscriptionSegments.filter((segment) => {
-          const t = Number(segment.time);
-          return Number.isFinite(t) && (t < range.firstTime || t > range.lastTime + 0.5);
-        }),
-        ...segments
-      ].sort((a, b) => a.time - b.time);
-      saveCurrentTranscriptToCache(0);
-      host.onTranscriptChanged();
-      showNotice(`已重新识别 ${Keji.formatTime(range.start)}–${Keji.formatTime(range.end)}，结果已替换选中内容。`, 'success');
-    },
-    '重新识别失败。'
-  );
+    textarea.setRangeText(`${replacement}${range.suffix}`, range.replaceStart, range.replaceEnd, 'select');
+    workspace.transcript = textarea.value;
+    transcriptManuallyEdited = true;
+    autoTranscriptionText = '';
+    latestTranscriptionSegments = [
+      ...latestTranscriptionSegments.filter((segment) => {
+        const t = Number(segment.time);
+        return Number.isFinite(t) && (t < range.firstTime || t > range.lastTime + 0.5);
+      }),
+      ...segments
+    ].sort((a, b) => a.time - b.time);
+    saveCurrentTranscriptToCache(0);
+    host.onTranscriptChanged();
+    showNotice(`已重新识别 ${Keji.formatTime(range.start)}–${Keji.formatTime(range.end)}，结果已替换选中内容。`, 'success');
+  } catch (error) {
+    showNotice((error as Error).message || '重新识别失败。', 'error');
+  } finally {
+    transcriptionState.retranscribingSelection = false;
+  }
 }
 
 export async function importTranscriptFile(file?: File, fileInput?: HTMLInputElement | null): Promise<void> {
